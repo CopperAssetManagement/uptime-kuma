@@ -69,7 +69,7 @@
         "generate-changelog": "node ./extra/generate-changelog.mjs"
     },
     "dependencies": {
-        "@grpc/grpc-js": "~1.8.22",
+        "@grpc/grpc-js": "~1.14.5",
         "@louislam/ping": "~0.4.4-mod.1",
         "@louislam/sqlite3": "15.1.6",
         "@vvo/tzdb": "~6.198.0",
