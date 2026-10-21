@@ -72,17 +72,26 @@ router.get("/api/status-page/heartbeat/:slug", cache("1 minutes"), async (reques
         slug = slug.toLowerCase();
         let statusPageID = await StatusPage.slugToID(slug);
 
-        let monitorIDList = await R.getCol(
+        let monitors = await R.getAll(
             `
-            SELECT monitor_group.monitor_id FROM monitor_group, \`group\`
-            WHERE monitor_group.group_id = \`group\`.id
-            AND public = 1
-            AND \`group\`.status_page_id = ?
+            SELECT DISTINCT monitor.id AS monitor_id,
+                (monitor.type = 'push' AND EXISTS (
+                    SELECT 1 FROM monitor_tag
+                    JOIN tag ON tag.id = monitor_tag.tag_id
+                    WHERE monitor_tag.monitor_id = monitor.id
+                    AND tag.name = 'public-deployment-receipt'
+                    AND monitor_tag.value = 'github.com'
+                )) AS public_deployment_receipt
+            FROM monitor_group
+            JOIN \`group\` ON monitor_group.group_id = \`group\`.id
+            JOIN monitor ON monitor.id = monitor_group.monitor_id
+            WHERE public = 1 AND \`group\`.status_page_id = ?
         `,
             [statusPageID]
         );
 
-        for (let monitorID of monitorIDList) {
+        for (let monitor of monitors) {
+            const monitorID = monitor.monitor_id;
             let list = await R.getAll(
                 `
                     SELECT * FROM heartbeat
@@ -94,7 +103,7 @@ router.get("/api/status-page/heartbeat/:slug", cache("1 minutes"), async (reques
             );
 
             list = R.convertToBeans("heartbeat", list);
-            heartbeatList[monitorID] = list.reverse().map((row) => row.toPublicJSON());
+            heartbeatList[monitorID] = list.reverse().map((row) => row.toPublicJSON(Number(monitor.public_deployment_receipt) === 1));
 
             const uptimeCalculator = await UptimeCalculator.getUptimeCalculator(monitorID);
             uptimeList[`${monitorID}_24`] = uptimeCalculator.get24Hour().uptime;

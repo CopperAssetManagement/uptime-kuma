@@ -3,6 +3,7 @@ name: Build Custom Docker Image
 on:
   push:
     branches:
+      - main
       - feature/cascade-suppression
 
 env:
