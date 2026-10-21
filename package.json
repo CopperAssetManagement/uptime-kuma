@@ -186,7 +186,7 @@
         "cronstrue": "~2.24.0",
         "cross-env": "~7.0.3",
         "dns2": "~2.0.5",
-        "dompurify": "~3.4.0",
+        "dompurify": "~3.4.16",
         "eslint": "~8.14.0",
         "eslint-config-prettier": "^10.1.8",
         "eslint-plugin-jsdoc": "~46.4.6",
