@@ -1,0 +1,6 @@
+# CODEOWNERS: a pull request that changes a file listed here needs Chris's approval before it
+# merges (GitHub enforces this with the code-owner review rule). Agents merge every other pull
+# request themselves once its required checks pass (Platform docs/WORKSHOP.md).
+
+# Workflows build the image node1 runs; Platform pins it before node1 uses it.
+/.github/ @chrisbaber
