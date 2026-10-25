@@ -1,5 +1,31 @@
 # CODEOWNERS: a pull request that changes a file listed here needs Chris's approval before it
 # merges (GitHub enforces this with the code-owner review rule).
+#
+# Protected classes: `.github/**`, CODEOWNERS, authentication and authorization code, secret
+# contracts, release files, and deploy configuration that carries security settings. This fork
+# has no secret contracts or release files of its own: node1 runs the image digest that
+# Platform pins, and Platform's release ships it. Everything else merges once checks pass.
 
+# --- .github/** and this file -----------------------------------------------
 # Workflows build the image node1 runs; Platform pins it before node1 uses it.
-/.github/ @chrisbaber
+/.github/                                          @chrisbaber
+/.github/CODEOWNERS                                @chrisbaber
+
+# --- Authentication and authorization ---------------------------------------
+# Login, basic and API-key authentication, password hashing, two-factor,
+# login rate limits, the user and API-key models and the API-key handlers.
+# The login and token socket handlers themselves live in server/server.js,
+# which is not owned because almost every change touches it.
+/server/auth.js                                    @chrisbaber
+/server/2fa.js                                     @chrisbaber
+/server/password-hash.js                           @chrisbaber
+/server/rate-limiter.js                            @chrisbaber
+/server/model/user.js                              @chrisbaber
+/server/model/api_key.js                           @chrisbaber
+/server/socket-handlers/api-key-socket-handler.js  @chrisbaber
+
+# --- Deploy configuration ---------------------------------------------------
+# The Dockerfiles that build the image node1 runs (base image, user, ports).
+/docker/dockerfile                                 @chrisbaber
+/docker/debian-base.dockerfile                     @chrisbaber
+/docker/builder-go.dockerfile                      @chrisbaber
