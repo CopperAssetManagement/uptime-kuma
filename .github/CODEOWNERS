@@ -1,12 +1,26 @@
-# CODEOWNERS: a pull request that changes a file listed here needs Chris's approval before it
-# merges (GitHub enforces this with the code-owner review rule).
+# CODEOWNERS: a pull request that changes a file listed here needs @chrisbaber's approval
+# before it merges (the organization ruleset requires code-owner review), and its description
+# must explain each such file under "## Protected changes" (the protected-changes check).
+# Everything else merges once the required checks pass.
 #
-# Protected classes: `.github/**`, CODEOWNERS, authentication and authorization code, secret
-# contracts, release files, and deploy configuration that carries security settings. This fork
-# has no secret contracts or release files of its own: node1 runs the image digest that
-# Platform pins, and Platform's release ships it. Everything else merges once checks pass.
+# Owned in every CopperAssetManagement repository, where the repository has it:
+# - .github/ and this file
+# - releases/ (release requests)
+# - authentication, session, authorization/RBAC, crypto/signing and other security code
+# - secret and credential handling code and secret contracts
+# - database schema and access control (migrations, row-level security, privilege grants)
+# - deployment and infrastructure config (vercel.json, Dockerfiles, ansible, deploy scripts)
+# - anything that can disable or weaken a check (CI gate scripts, PII and data guards,
+#   git hook setup)
+# Not owned: package manifests, lockfiles, TypeScript, lint and format config, Node and npm
+# config (unless it points to a private registry or holds credentials), ordinary application
+# code and documentation.
+# Every pattern below must match at least one tracked file (releases/ excepted).
 
-# --- .github/** and this file -----------------------------------------------
+# This fork has no release files or secret contracts of its own: node1 runs the image digest
+# that Platform pins, and Platform's release ships it.
+
+# --- .github/ and this file -------------------------------------------------
 # Workflows build the image node1 runs; Platform pins it before node1 uses it.
 /.github/                                          @chrisbaber
 /.github/CODEOWNERS                                @chrisbaber
@@ -15,7 +29,7 @@
 # Login, basic and API-key authentication, password hashing, two-factor,
 # login rate limits, the user and API-key models and the API-key handlers.
 # The login and token socket handlers themselves live in server/server.js,
-# which is not owned because almost every change touches it.
+# which is not owned because almost every upstream change touches it.
 /server/auth.js                                    @chrisbaber
 /server/2fa.js                                     @chrisbaber
 /server/password-hash.js                           @chrisbaber
@@ -24,8 +38,16 @@
 /server/model/api_key.js                           @chrisbaber
 /server/socket-handlers/api-key-socket-handler.js  @chrisbaber
 
-# --- Deploy configuration ---------------------------------------------------
-# The Dockerfiles that build the image node1 runs (base image, user, ports).
-/docker/dockerfile                                 @chrisbaber
-/docker/debian-base.dockerfile                     @chrisbaber
-/docker/builder-go.dockerfile                      @chrisbaber
+# --- Secret handling --------------------------------------------------------
+# Reads the database password from the environment or a Docker secret file and
+# runs the unauthenticated first-run database setup page.
+/server/setup-database.js                          @chrisbaber
+
+# --- Database schema --------------------------------------------------------
+# The migrations that run against node1's database when the image starts.
+/db/knex_migrations/                               @chrisbaber
+
+# --- Deployment config ------------------------------------------------------
+# The Dockerfiles that build the image node1 runs (base image, user, ports) and
+# the files they copy into it, including the image's sudoers.
+/docker/                                           @chrisbaber
