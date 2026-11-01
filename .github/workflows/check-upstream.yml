@@ -1,0 +1,34 @@
+name: Check Upstream Issue #1089
+
+on:
+  schedule:
+    - cron: '0 9 1 * *'  # 1st of each month at 9:00 UTC
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check upstream issue status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          STATE=$(gh api repos/louislam/uptime-kuma/issues/1089 --jq '.state')
+          TITLE=$(gh api repos/louislam/uptime-kuma/issues/1089 --jq '.title')
+          UPDATED=$(gh api repos/louislam/uptime-kuma/issues/1089 --jq '.updated_at')
+
+          echo "Issue #1089: $TITLE"
+          echo "State: $STATE"
+          echo "Last updated: $UPDATED"
+
+          if [ "$STATE" != "open" ]; then
+            echo "::warning::Upstream issue #1089 is now $STATE! Cascade suppression may be available natively. Check https://github.com/louislam/uptime-kuma/issues/1089"
+            exit 1
+          fi
+
+          echo "Issue is still open — our fork is still needed."

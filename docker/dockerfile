@@ -18,18 +18,17 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=1
 COPY --chown=node:node .npmrc .npmrc
 COPY --chown=node:node package.json package.json
 COPY --chown=node:node package-lock.json package-lock.json
-RUN npm ci --omit=dev
-COPY . .
+RUN npm ci
+COPY --chown=node:node . .
+RUN npm run build && rm -rf node_modules && npm ci --omit=dev
 COPY --chown=node:node --from=build_healthcheck /app/extra/healthcheck /app/extra/healthcheck
-RUN mkdir ./data
+RUN mkdir -p ./data
 
 ############################################
 # ⭐ Main Image
 ############################################
 FROM $BASE_IMAGE AS release
 WORKDIR /app
-
-LABEL org.opencontainers.image.source="https://github.com/louislam/uptime-kuma"
 
 ENV UPTIME_KUMA_IS_CONTAINER=1
 
@@ -115,4 +114,3 @@ RUN chmod +x /app/extra/upload-github-release-asset.sh
 # Dist only
 RUN cd /app && tar -zcvf $DIST dist
 RUN /app/extra/upload-github-release-asset.sh github_api_token=$GITHUB_TOKEN owner=louislam repo=uptime-kuma tag=$VERSION filename=/app/$DIST
-
