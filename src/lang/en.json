@@ -1105,6 +1105,8 @@
     "Badge URL": "Badge URL",
     "Group": "Group",
     "Monitor Group": "Monitor Group",
+    "Suppress notifications when parent is down": "Suppress notifications when parent is down",
+    "suppressOnParentDownDescription": "When enabled, notifications for this monitor are delayed and suppressed if the parent monitor is also down. Prevents alert storms when a parent service (e.g., VPS) fails.",
     "monitorToastMessagesLabel": "Monitor Toast notifications",
     "monitorToastMessagesDescription": "Toast notifications for monitors disappear after given time in seconds. Set to -1 disables timeout. Set to 0 disables toast notifications.",
     "toastErrorTimeout": "Timeout for Error Notifications",

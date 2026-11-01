@@ -54,6 +54,7 @@ const { DockerHost } = require("../docker");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 const { UptimeCalculator } = require("../uptime-calculator");
+const { notificationQueue } = require("../notification-queue");
 const { CookieJar } = require("tough-cookie");
 const { HttpsCookieAgent } = require("http-cookie-agent/http");
 const https = require("https");
@@ -64,6 +65,10 @@ const brotliCompress = promisify(zlib.brotliCompress);
 const DomainExpiry = require("./domain_expiry");
 
 const rootCertificates = rootCertificatesFingerprints();
+
+// Maximum safe value for setTimeout (2^31 - 1 ms ≈ 24.8 days).
+// Values exceeding this trigger Node.js TimeoutOverflowWarning.
+const MAX_TIMEOUT_MS = 2147483647;
 
 /**
  * status:
@@ -207,6 +212,7 @@ class Monitor extends BeanModel {
             ipFamily: this.ipFamily,
             sftpPath: this.sftpPath,
             sshAuthMethod: this.sshAuthMethod || "password",
+            suppressOnParentDown: this.suppressOnParentDown,
 
             // ping advanced options
             ping_numeric: this.isPingNumeric(),
@@ -773,7 +779,7 @@ class Monitor extends BeanModel {
                             // No need to insert successful heartbeat for push type, so end here
                             retries = 0;
                             log.debug("monitor", `[${this.name}] timeout = ${timeout}`);
-                            this.heartbeatInterval = setTimeout(safeBeat, timeout);
+                            this.heartbeatInterval = setTimeout(safeBeat, Math.min(timeout, MAX_TIMEOUT_MS));
                             return;
                         }
                     } else {
@@ -970,9 +976,24 @@ class Monitor extends BeanModel {
             if (isImportant) {
                 bean.important = true;
 
+                if (bean.status !== DOWN) {
+                    notificationQueue.cancel(this.id);
+                }
+
                 if (Monitor.isImportantForNotification(isFirstBeat, previousBeat?.status, bean.status)) {
-                    log.debug("monitor", `[${this.name}] sendNotification`);
-                    await Monitor.sendNotification(isFirstBeat, this, bean);
+                    if (this.suppressOnParentDown && this.parent && bean.status === DOWN) {
+                        log.debug("monitor", `[${this.name}] Queuing notification (cascade suppression enabled)`);
+                        const parentRow = await R.getRow("SELECT `interval` FROM monitor WHERE id = ?", [this.parent]);
+                        if (!parentRow) {
+                            log.warn("monitor", `[${this.name}] Parent monitor ${this.parent} is absent; sending without suppression`);
+                            await Monitor.sendNotification(isFirstBeat, this, bean);
+                        } else {
+                            notificationQueue.enqueue(this, bean, isFirstBeat, Monitor.sendNotification, parentRow.interval);
+                        }
+                    } else {
+                        log.debug("monitor", `[${this.name}] sendNotification`);
+                        await Monitor.sendNotification(isFirstBeat, this, bean);
+                    }
                 } else {
                     log.debug(
                         "monitor",
@@ -995,11 +1016,22 @@ class Monitor extends BeanModel {
                     ++bean.downCount;
                     if (bean.downCount >= this.resendInterval) {
                         // Send notification again, because we are still DOWN
-                        log.debug(
-                            "monitor",
-                            `[${this.name}] sendNotification again: Down Count: ${bean.downCount} | Resend Interval: ${this.resendInterval}`
-                        );
-                        await Monitor.sendNotification(isFirstBeat, this, bean);
+                        if (this.suppressOnParentDown && this.parent) {
+                            log.debug("monitor", `[${this.name}] Queuing resend notification (cascade suppression enabled)`);
+                            const parentRow = await R.getRow("SELECT `interval` FROM monitor WHERE id = ?", [this.parent]);
+                            if (!parentRow) {
+                                log.warn("monitor", `[${this.name}] Parent monitor ${this.parent} is absent; sending without suppression`);
+                                await Monitor.sendNotification(isFirstBeat, this, bean);
+                            } else {
+                                notificationQueue.enqueue(this, bean, isFirstBeat, Monitor.sendNotification, parentRow.interval);
+                            }
+                        } else {
+                            log.debug(
+                                "monitor",
+                                `[${this.name}] sendNotification again: Down Count: ${bean.downCount} | Resend Interval: ${this.resendInterval}`
+                            );
+                            await Monitor.sendNotification(isFirstBeat, this, bean);
+                        }
 
                         // Reset down count
                         bean.downCount = 0;
@@ -1083,7 +1115,7 @@ class Monitor extends BeanModel {
 
                 log.debug("monitor", `[${this.name}] Next heartbeat in: ${intervalRemainingMs}ms`);
 
-                this.heartbeatInterval = setTimeout(safeBeat, intervalRemainingMs);
+                this.heartbeatInterval = setTimeout(safeBeat, Math.min(intervalRemainingMs, MAX_TIMEOUT_MS));
             } else {
                 log.info("monitor", `[${this.name}] isStop = true, no next check.`);
             }
@@ -1103,7 +1135,7 @@ class Monitor extends BeanModel {
 
                 if (!this.isStop) {
                     log.info("monitor", "Try to restart the monitor");
-                    this.heartbeatInterval = setTimeout(safeBeat, this.interval * 1000);
+                    this.heartbeatInterval = setTimeout(safeBeat, Math.min(this.interval * 1000, MAX_TIMEOUT_MS));
                 }
             }
         };
@@ -1112,7 +1144,7 @@ class Monitor extends BeanModel {
         if (this.type === "push") {
             this.heartbeatInterval = setTimeout(() => {
                 safeBeat();
-            }, this.interval * 1000);
+            }, Math.min(this.interval * 1000, MAX_TIMEOUT_MS));
         } else {
             safeBeat();
         }
