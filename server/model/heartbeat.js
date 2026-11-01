@@ -14,15 +14,31 @@ class Heartbeat extends BeanModel {
     /**
      * Return an object that ready to parse to JSON for public
      * Only show necessary data to public
+     * @param {boolean} publicDeploymentReceipt Explicit monitor opt-in for deployment receipts
      * @returns {object} Object ready to parse
      */
-    toPublicJSON() {
-        return {
+    toPublicJSON(publicDeploymentReceipt = false) {
+        const data = {
             status: this.status,
             time: this.time,
             msg: "", // Hide for public
             ping: this.ping,
         };
+
+        // Publish a bounded receipt, never the message. Failures and arbitrary
+        // messages remain private even on an opted-in monitor. A complete match
+        // also rejects JavaScript's special end-of-string newline behavior.
+        if (publicDeploymentReceipt === true && this.status === 1 && typeof this.msg === "string") {
+            const match = /^PASS ([0-9a-f]{40}) source=github\.com$/.exec(this.msg);
+            if (match && match[0] === this.msg) {
+                data.deploymentReceipt = {
+                    sha: match[1],
+                    source: "github.com",
+                    time: this.time,
+                };
+            }
+        }
+        return data;
     }
 
     /**
