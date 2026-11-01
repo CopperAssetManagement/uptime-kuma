@@ -57,7 +57,7 @@ describe("Public deployment receipts", () => {
         const { UptimeKumaServer } = require("../../server/uptime-kuma-server");
         const StatusPage = require("../../server/model/status_page");
         const { UptimeCalculator } = require("../../server/uptime-calculator");
-        const apicache = require("../../server/modules/apicache");
+        const apicache = require("../../server/utils/response-cache");
         mock.method(UptimeKumaServer, "getInstance", () => ({}));
         mock.method(StatusPage, "slugToID", async () => 1);
         mock.method(UptimeCalculator, "getUptimeCalculator", async () => ({ get24Hour: () => ({ uptime: 1 }) }));
@@ -122,9 +122,7 @@ describe("Public deployment receipts", () => {
             if (listener) {
                 await new Promise((resolve) => listener.close(resolve));
             }
-            for (const key of apicache.getIndex().all) {
-                apicache.clear(key);
-            }
+            apicache.clear();
             mock.restoreAll();
             await db.destroy();
         }

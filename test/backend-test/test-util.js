@@ -6,7 +6,7 @@ const { SQL_DATETIME_FORMAT } = require("../../src/util");
 
 /**
  * Retries a test function with exponential backoff for external service reliability.
- * Logs a warning instead of failing the test if all retries are exhausted.
+ * Propagates the last failure when all retries are exhausted.
  * @param {Function} testFn - Async function to retry
  * @param {number} maxAttempts - Maximum number of retry attempts (default: 5)
  * @returns {Promise<void>}
@@ -27,8 +27,7 @@ async function retryExternalService(testFn, maxAttempts = 5) {
             }
         }
     }
-    // If all retries failed, log warning instead of failing the test
-    console.warn(`[WARN] External service test failed after ${maxAttempts} attempts: ${lastError.message}`);
+    throw lastError;
 }
 
 module.exports = { retryExternalService };
@@ -50,5 +49,26 @@ describe("Server Utilities", () => {
         // Verify it can be parsed back
         const parsedDate = dayjs.utc(sqlFormat, SQL_DATETIME_FORMAT);
         assert.strictEqual(parsedDate.unix(), current.unix());
+    });
+});
+
+
+describe("External service retries", () => {
+    test("propagates an exhausted assertion failure", async () => {
+        const failure = new assert.AssertionError({ message: "incorrect expiry" });
+        let attempts = 0;
+        await assert.rejects(retryExternalService(async () => {
+            attempts += 1;
+            throw failure;
+        }, 1), (error) => error === failure);
+        assert.strictEqual(attempts, 1);
+    });
+
+    test("returns after success without another attempt", async () => {
+        let attempts = 0;
+        await retryExternalService(async () => {
+            attempts += 1;
+        });
+        assert.strictEqual(attempts, 1);
     });
 });

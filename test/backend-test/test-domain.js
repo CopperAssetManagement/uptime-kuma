@@ -10,10 +10,41 @@ const { Notification } = require("../../server/notification");
 const { Settings } = require("../../server/settings");
 const { setSetting } = require("../../server/util-server");
 const dayjs = require("dayjs");
+const dns = require("node:dns");
 const { retryExternalService } = require("./test-util");
 dayjs.extend(require("dayjs/plugin/utc"));
 
 const testDb = new TestDB();
+
+/**
+ * Control RDAP transport without depending on real registration renewals.
+ * @param {import("node:test").TestContext} t Test context
+ * @param {string} domain Domain queried by the production RDAP client
+ * @param {string} expiry Registry expiration timestamp
+ * @returns {object} Mutable registry fixture and request count
+ */
+function mockRegistry(t, domain, expiry) {
+    const bootstrap = require("../../extra/rdap-dns.json");
+    const suffix = domain.split(".").pop();
+    const [, servers] = bootstrap.services.find(([suffixes]) => suffixes.includes(suffix));
+    const fixture = { expiry, requests: 0 };
+    t.mock.method(globalThis, "fetch", async (url) => {
+        if (url === "https://data.iana.org/rdap/dns.json") {
+            return new Response(JSON.stringify(bootstrap));
+        }
+        assert.strictEqual(url, `${servers[0]}domain/${domain}`);
+        fixture.requests += 1;
+        return new Response(JSON.stringify({
+            objectClassName: "domain",
+            ldhName: domain,
+            events: [
+                { eventAction: "registration", eventDate: "2013-11-26T12:00:00.000Z" },
+                { eventAction: "expiration", eventDate: fixture.expiry },
+            ],
+        }));
+    });
+    return fixture;
+}
 
 describe("Domain Expiry", () => {
     const monHttpCom = {
@@ -32,11 +63,19 @@ describe("Domain Expiry", () => {
         await testDb.destroy();
     });
 
-    test("getExpiryDate() returns correct expiry date for .wiki domain with no A record", async () => {
-        await retryExternalService(async () => {
-            const d = DomainExpiry.createByName("google.wiki");
-            assert.deepEqual(await d.getExpiryDate(), new Date("2026-11-26T23:59:59.000Z"));
+    test("getExpiryDate() returns correct expiry date for .wiki domain with no A record", async (t) => {
+        // Registrations renew. Control the registry response rather than pinning
+        // this regression to a live domain's ever-changing expiration date.
+        const registry = mockRegistry(t, "google.wiki", "2026-11-26T23:59:59.000Z");
+        t.mock.method(dns, "lookup", () => {
+            assert.fail("Domain expiry must use RDAP without resolving the domain's A record");
         });
+        const d = DomainExpiry.createByName("google.wiki");
+        assert.deepEqual(await d.getExpiryDate(), new Date("2026-11-26T23:59:59.000Z"));
+        registry.expiry = "2027-11-26T23:59:59.000Z";
+        assert.deepEqual(await d.getExpiryDate(), new Date("2027-11-26T23:59:59.000Z"));
+        assert.strictEqual(registry.requests, 2);
+        assert.strictEqual(dns.lookup.mock.callCount(), 0);
     });
 
     describe("checkSupport()", () => {
@@ -176,20 +215,21 @@ describe("Domain Expiry", () => {
         });
     });
 
-    test("findByDomainNameOrCreate() retrieves expiration date for .com domain from RDAP", async () => {
-        await retryExternalService(async () => {
-            const domain = await DomainExpiry.findByDomainNameOrCreate("google.com");
-            const expiryFromRdap = await domain.getExpiryDate(); // from RDAP
-            assert.deepEqual(expiryFromRdap, new Date("2028-09-14T04:00:00.000Z"));
-        });
+    test("findByDomainNameOrCreate() retrieves expiration date for .com domain from RDAP", async (t) => {
+        const registry = mockRegistry(t, "google.com", "2028-09-14T04:00:00.000Z");
+        const domain = await DomainExpiry.findByDomainNameOrCreate("google.com");
+        const expiryFromRdap = await domain.getExpiryDate();
+        assert.deepEqual(expiryFromRdap, new Date("2028-09-14T04:00:00.000Z"));
+        assert.strictEqual(registry.requests, 1);
     });
 
-    test("checkExpiry() caches expiration date in database", async () => {
-        await retryExternalService(async () => {
-            await DomainExpiry.checkExpiry("google.com"); // RDAP -> Cache
-            const domain = await DomainExpiry.findByName("google.com");
-            assert(dayjs.utc().diff(dayjs.utc(domain.lastCheck), "second") < 5);
-        });
+    test("checkExpiry() caches expiration date in database", async (t) => {
+        const registry = mockRegistry(t, "google.com", "2028-09-14T04:00:00.000Z");
+        await DomainExpiry.checkExpiry("google.com");
+        const domain = await DomainExpiry.findByName("google.com");
+        assert(dayjs.utc().diff(dayjs.utc(domain.lastCheck), "second") < 5);
+        assert.deepEqual(new Date(domain.expiry), new Date("2028-09-14T04:00:00.000Z"));
+        assert.strictEqual(registry.requests, 1);
     });
 
     test("sendNotifications() triggers notification for expiring domain", async () => {
