@@ -6,7 +6,7 @@ concurrency:
 
 on:
   push:
-    branches: [master, 1.23.X, 3.0.0]
+    branches: [main, master, 1.23.X, 3.0.0]
   pull_request:
 permissions: {}
 
@@ -152,3 +152,19 @@ jobs:
 
       - run: npm run build
       - run: npm run test-e2e
+
+  ci:
+    name: CI
+    needs: [auto-test, armv7-simple-test, check-linters, e2e-test]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Existing test groups succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          test -n "$RESULTS"
+          for result in $RESULTS; do
+            test "$result" = success || exit 1
+          done

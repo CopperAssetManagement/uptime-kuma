@@ -15,7 +15,7 @@
 # Not owned: package manifests, lockfiles, TypeScript, lint and format config, Node and npm
 # config (unless it points to a private registry or holds credentials), ordinary application
 # code and documentation.
-# Every pattern below must match at least one tracked file (releases/ excepted).
+# Every pattern below must match a tracked file, except releases/ and reserved detector policy.
 
 # This fork has no release files or secret contracts of its own: node1 runs the image digest
 # that Platform pins, and Platform's release ships it.
@@ -51,3 +51,9 @@
 # The Dockerfiles that build the image node1 runs (base image, user, ports) and
 # the files they copy into it, including the image's sudoers.
 /docker/                                           @chrisbaber
+
+# Publication admission, setup, and reserved native detector policy.
+/.githooks/                                        @chrisbaber
+/scripts/bootstrap.sh                              @chrisbaber
+/.gitleaks.toml                                    @chrisbaber
+/.gitleaksignore                                   @chrisbaber
