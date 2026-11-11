@@ -148,7 +148,7 @@ const { initBackgroundJobs, stopBackgroundJobs } = require("./jobs");
 const { loginRateLimiter, twoFaRateLimiter } = require("./rate-limiter");
 
 const { apiAuth } = require("./auth");
-const { login } = require("./auth");
+const { login, loginByAPIKey, apiKeyID } = require("./auth");
 const passwordHash = require("./password-hash");
 
 const { Prometheus } = require("./prometheus");
@@ -523,6 +523,51 @@ let needSetup = false;
                 callback({
                     ok: false,
                     msg: "authIncorrectCreds",
+                    msgi18n: true,
+                });
+            }
+        });
+
+        // Login with an API key (Settings -> API Keys), for automation that cannot
+        // answer a password or 2FA prompt. The key's own expiry and active flag apply,
+        // and revoking the key in the UI stops new logins.
+        socket.on("loginByApiKey", async (key, callback) => {
+            const clientIP = await server.getClientIP(socket);
+
+            log.info("auth", `Login by API key. IP=${clientIP}`);
+
+            if (typeof callback !== "function") {
+                return;
+            }
+
+            // Login Rate Limit
+            if (!(await loginRateLimiter.pass(callback))) {
+                log.info("auth", `Too many failed requests for API key login. IP=${clientIP}`);
+                return;
+            }
+
+            let user = await loginByAPIKey(key);
+
+            if (user) {
+                await afterLogin(socket, user);
+
+                log.info(
+                    "auth",
+                    `Successfully logged in user ${user.username} with API key ${apiKeyID(key)}. IP=${clientIP}`
+                );
+
+                callback({
+                    ok: true,
+                });
+            } else {
+                log.warn(
+                    "auth",
+                    `Invalid, inactive or expired API key ${apiKeyID(key) ?? "(malformed)"}. IP=${clientIP}`
+                );
+
+                callback({
+                    ok: false,
+                    msg: "authInvalidToken",
                     msgi18n: true,
                 });
             }

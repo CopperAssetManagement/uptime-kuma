@@ -63,6 +63,30 @@ async function verifyAPIKey(key) {
 }
 
 /**
+ * The ID of a formatted API key (uk<id>_<secret>), for log lines; never the secret
+ * @param {string} key Formatted API key
+ * @returns {(string|null)} Key ID, or null when the key is malformed
+ */
+exports.apiKeyID = function (key) {
+    const match = typeof key === "string" ? /^uk(\d+)_./.exec(key) : null;
+    return match ? match[1] : null;
+};
+
+/**
+ * Login with an API key: the active user that owns a valid, active and unexpired key
+ * @param {string} key Formatted API key (uk<id>_<secret>)
+ * @returns {Promise<(Bean|null)>} User or null if the key or its user is not valid
+ */
+exports.loginByAPIKey = async function (key) {
+    const id = exports.apiKeyID(key);
+    if (id === null || !(await verifyAPIKey(key))) {
+        return null;
+    }
+    const apiKey = await R.findOne("api_key", " id = ? ", [id]);
+    return await R.findOne("user", " id = ? AND active = 1 ", [apiKey.user_id]);
+};
+
+/**
  * Callback for basic auth authorizers
  * @callback authCallback
  * @param {any} err Any error encountered
