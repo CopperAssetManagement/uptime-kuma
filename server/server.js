@@ -148,7 +148,7 @@ const { initBackgroundJobs, stopBackgroundJobs } = require("./jobs");
 const { loginRateLimiter, twoFaRateLimiter } = require("./rate-limiter");
 
 const { apiAuth } = require("./auth");
-const { login } = require("./auth");
+const { login, loginByAPIKey, apiKeyID } = require("./auth");
 const passwordHash = require("./password-hash");
 
 const { Prometheus } = require("./prometheus");
@@ -528,6 +528,51 @@ let needSetup = false;
             }
         });
 
+        // Login with an API key (Settings -> API Keys), for automation that cannot
+        // answer a password or 2FA prompt. The key's own expiry and active flag apply,
+        // and revoking the key in the UI stops new logins.
+        socket.on("loginByApiKey", async (key, callback) => {
+            const clientIP = await server.getClientIP(socket);
+
+            log.info("auth", `Login by API key. IP=${clientIP}`);
+
+            if (typeof callback !== "function") {
+                return;
+            }
+
+            // Login Rate Limit
+            if (!(await loginRateLimiter.pass(callback))) {
+                log.info("auth", `Too many failed requests for API key login. IP=${clientIP}`);
+                return;
+            }
+
+            let user = await loginByAPIKey(key);
+
+            if (user) {
+                await afterLogin(socket, user, Number(apiKeyID(key)));
+
+                log.info(
+                    "auth",
+                    `Successfully logged in user ${user.username} with API key ${apiKeyID(key)}. IP=${clientIP}`
+                );
+
+                callback({
+                    ok: true,
+                });
+            } else {
+                log.warn(
+                    "auth",
+                    `Invalid, inactive or expired API key ${apiKeyID(key) ?? "(malformed)"}. IP=${clientIP}`
+                );
+
+                callback({
+                    ok: false,
+                    msg: "authInvalidToken",
+                    msgi18n: true,
+                });
+            }
+        });
+
         socket.on("logout", async (callback) => {
             // Rate Limit
             if (!(await loginRateLimiter.pass(callback))) {
@@ -536,6 +581,7 @@ let needSetup = false;
 
             socket.leave(socket.userID);
             socket.userID = null;
+            socket.apiKeyID = null;
 
             if (typeof callback === "function") {
                 callback();
@@ -1830,10 +1876,14 @@ async function checkOwner(userID, monitorID) {
  * This function is used to send the heartbeat list of a monitor.
  * @param {Socket} socket Socket.io instance
  * @param {object} user User object
+ * @param {(number|null)} apiKeyID ID of the API key the session logged in with, if any
  * @returns {Promise<void>}
  */
-async function afterLogin(socket, user) {
+async function afterLogin(socket, user, apiKeyID = null) {
     socket.userID = user.id;
+    // Set with the user, before any await: a session opened with an API key may
+    // not manage API keys (api-key-socket-handler.js), from its first event on.
+    socket.apiKeyID = apiKeyID;
     socket.join(user.id);
 
     let monitorList = await server.sendMonitorList(socket);

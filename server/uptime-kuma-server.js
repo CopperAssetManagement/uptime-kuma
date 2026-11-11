@@ -543,6 +543,23 @@ class UptimeKumaServer {
     }
 
     /**
+     * Disconnect every session that logged in with an API key, when the key is
+     * disabled or deleted, so revoking a key also ends its open sessions.
+     * @param {(number|string)} apiKeyID API key ID
+     * @returns {void}
+     */
+    disconnectAPIKeySessions(apiKeyID) {
+        for (const socket of this.io.sockets.sockets.values()) {
+            if (socket.apiKeyID != null && socket.apiKeyID === Number(apiKeyID)) {
+                try {
+                    socket.emit("refresh");
+                    socket.disconnect();
+                } catch (e) {}
+            }
+        }
+    }
+
+    /**
      * Force connected sockets of a user to refresh and disconnect.
      * Used for resetting password.
      * @param {string} userID User ID
