@@ -549,7 +549,7 @@ let needSetup = false;
             let user = await loginByAPIKey(key);
 
             if (user) {
-                await afterLogin(socket, user);
+                await afterLogin(socket, user, Number(apiKeyID(key)));
 
                 log.info(
                     "auth",
@@ -581,6 +581,7 @@ let needSetup = false;
 
             socket.leave(socket.userID);
             socket.userID = null;
+            socket.apiKeyID = null;
 
             if (typeof callback === "function") {
                 callback();
@@ -1875,10 +1876,14 @@ async function checkOwner(userID, monitorID) {
  * This function is used to send the heartbeat list of a monitor.
  * @param {Socket} socket Socket.io instance
  * @param {object} user User object
+ * @param {(number|null)} apiKeyID ID of the API key the session logged in with, if any
  * @returns {Promise<void>}
  */
-async function afterLogin(socket, user) {
+async function afterLogin(socket, user, apiKeyID = null) {
     socket.userID = user.id;
+    // Set with the user, before any await: a session opened with an API key may
+    // not manage API keys (api-key-socket-handler.js), from its first event on.
+    socket.apiKeyID = apiKeyID;
     socket.join(user.id);
 
     let monitorList = await server.sendMonitorList(socket);

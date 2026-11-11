@@ -82,8 +82,25 @@ exports.loginByAPIKey = async function (key) {
     if (id === null || !(await verifyAPIKey(key))) {
         return null;
     }
-    const apiKey = await R.findOne("api_key", " id = ? ", [id]);
+    // Read again for its owner: the key may have been deleted since it was verified.
+    const apiKey = await R.findOne("api_key", " id = ? AND active = 1 ", [id]);
+    if (!apiKey) {
+        return null;
+    }
     return await R.findOne("user", " id = ? AND active = 1 ", [apiKey.user_id]);
+};
+
+/**
+ * Refuse API key management from a session that logged in with an API key, so a
+ * key can neither mint a successor nor undo its own revocation.
+ * @param {object} socket Socket.io instance
+ * @returns {void}
+ * @throws {Error} The session logged in with an API key
+ */
+exports.checkNotAPIKeySession = function (socket) {
+    if (socket.apiKeyID != null) {
+        throw new Error("API keys cannot be managed from a session that logged in with an API key");
+    }
 };
 
 /**

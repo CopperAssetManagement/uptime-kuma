@@ -7,17 +7,15 @@ const apicache = require("../utils/response-cache");
 const APIKey = require("../model/api_key");
 const { Settings } = require("../settings");
 const { sendAPIKeyList } = require("../client");
+const { UptimeKumaServer } = require("../uptime-kuma-server");
+const { checkNotAPIKeySession } = require("../auth");
 
-/**
- * Handlers for API keys
- * @param {Socket} socket Socket.io instance
- * @returns {void}
- */
 module.exports.apiKeySocketHandler = (socket) => {
     // Add a new api key
     socket.on("addAPIKey", async (key, callback) => {
         try {
             checkLogin(socket);
+            checkNotAPIKeySession(socket);
 
             let clearKey = nanoid(40);
             let hashedKey = await passwordHash.generate(clearKey);
@@ -70,12 +68,14 @@ module.exports.apiKeySocketHandler = (socket) => {
     socket.on("deleteAPIKey", async (keyID, callback) => {
         try {
             checkLogin(socket);
+            checkNotAPIKeySession(socket);
 
             log.debug("apikeys", `Deleted API Key: ${keyID} User ID: ${socket.userID}`);
 
             await R.exec("DELETE FROM api_key WHERE id = ? AND user_id = ? ", [keyID, socket.userID]);
 
             apicache.clear();
+            UptimeKumaServer.getInstance().disconnectAPIKeySessions(keyID);
 
             callback({
                 ok: true,
@@ -95,12 +95,14 @@ module.exports.apiKeySocketHandler = (socket) => {
     socket.on("disableAPIKey", async (keyID, callback) => {
         try {
             checkLogin(socket);
+            checkNotAPIKeySession(socket);
 
             log.debug("apikeys", `Disabled Key: ${keyID} User ID: ${socket.userID}`);
 
             await R.exec("UPDATE api_key SET active = 0 WHERE id = ? ", [keyID]);
 
             apicache.clear();
+            UptimeKumaServer.getInstance().disconnectAPIKeySessions(keyID);
 
             callback({
                 ok: true,
@@ -120,6 +122,7 @@ module.exports.apiKeySocketHandler = (socket) => {
     socket.on("enableAPIKey", async (keyID, callback) => {
         try {
             checkLogin(socket);
+            checkNotAPIKeySession(socket);
 
             log.debug("apikeys", `Enabled Key: ${keyID} User ID: ${socket.userID}`);
 

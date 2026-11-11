@@ -94,6 +94,47 @@ describe("Login by API key", () => {
         }
     });
 
+    test("a key deleted after verification logs in nobody", async () => {
+        const original = R.findOne;
+        let reads = 0;
+        R.findOne = async (...args) => (args[0] === "api_key" && ++reads === 2 ? null : original.apply(R, args));
+        try {
+            assert.equal(await loginByAPIKey(`uk10_${SECRET}`), null);
+        } finally {
+            R.findOne = original;
+        }
+    });
+
+    test("a session opened with an API key cannot manage API keys", () => {
+        const { checkNotAPIKeySession } = require("../../server/auth");
+        assert.throws(() => checkNotAPIKeySession({ apiKeyID: 10 }), /cannot be managed/);
+        assert.doesNotThrow(() => checkNotAPIKeySession({ apiKeyID: null }));
+        assert.doesNotThrow(() => checkNotAPIKeySession({}));
+    });
+
+    test("revoking a key disconnects exactly the sessions it opened", () => {
+        const { UptimeKumaServer } = require("../../server/uptime-kuma-server");
+        const session = (apiKeyID) => ({
+            apiKeyID,
+            events: [],
+            emit(e) {
+                this.events.push(e);
+            },
+            disconnect() {
+                this.events.push("disconnect");
+            },
+        });
+        const sockets = [session(10), session(11), session(null), session(undefined)];
+        UptimeKumaServer.prototype.disconnectAPIKeySessions.call(
+            { io: { sockets: { sockets: new Map(sockets.map((s, i) => [i, s])) } } },
+            "10"
+        );
+        assert.deepEqual(
+            sockets.map((s) => s.events.length),
+            [2, 0, 0, 0]
+        );
+    });
+
     test("log lines name only the key ID", () => {
         assert.equal(apiKeyID(`uk10_${SECRET}`), "10");
         assert.equal(apiKeyID("not-a-key"), null);
