@@ -71,6 +71,11 @@ class NotificationQueue {
 
         // A resend that replaces a still-pending first DOWN still announces the outage.
         const replaced = this.pending.get(monitor.id);
+        if (replaced?.since !== undefined && !announcesOutage) {
+            // A re-check after the parent's recovery already decides whether this
+            // outage is announced; a resend tick must not bypass it.
+            return;
+        }
         announcesOutage = announcesOutage || Boolean(replaced?.announcesOutage);
         this.clearTimer(monitor.id);
 
@@ -130,7 +135,14 @@ class NotificationQueue {
     async resolve({ monitor, bean, isFirstBeat, sendFn, announcesOutage, since, freshBean }) {
         if (since !== undefined) {
             // A re-check after the parent's recovery decides on a fresh beat only.
-            const fresh = freshBean ?? (await R.findOne("heartbeat", " monitor_id = ? AND time > ? ORDER BY time DESC ", [monitor.id, since]));
+            let fresh = freshBean;
+            if (!fresh && monitor.type === "push") {
+                // The push window ran out after the recovery with no push at all:
+                // the producer is silent, so its latest DOWN stands.
+                fresh = await R.findOne("heartbeat", " monitor_id = ? ORDER BY time DESC ", [monitor.id]);
+            } else if (!fresh) {
+                fresh = await R.findOne("heartbeat", " monitor_id = ? AND time > ? ORDER BY time DESC ", [monitor.id, since]);
+            }
             if (!fresh) {
                 log.info("notification-queue", `[${monitor.name}] No fresh beat since its parent recovered; its DOWN stays suppressed`);
                 await setWithheld(monitor.id, SUPPRESSED);
@@ -316,12 +328,19 @@ class NotificationQueue {
      * @returns {object} The registered entry
      */
     holdForFreshBeat(child, latest, sendFn, parentInterval, since) {
-        const childIntervalS = Math.max(Number(child.interval) || 0, Number(child.retryInterval) || 0);
+        const intervalS = Number(child.interval) || 0;
+        const retryS = Number(child.retryInterval) || intervalS;
+        const retries = Math.max(0, Number(child.maxretries) || 0);
+        // A push child is decided by its producer within one push window; a
+        // checked child gets its first check plus its own retries.
+        // A check can outlast its retry interval, so each retry may also take its timeout.
+        const timeoutS = Math.max(0, Number(child.timeout) || 0);
+        const windowS = child.type === "push" ? intervalS : intervalS + retries * retryS + (retries + 1) * timeoutS;
         const delayMs = Math.min(
             MAX_TIMEOUT_MS,
-            Math.max(10000, parentInterval * 1000 + 5000, childIntervalS * 1000 + FRESH_BEAT_MARGIN_MS)
+            Math.max(10000, parentInterval * 1000 + 5000, windowS * 1000 + FRESH_BEAT_MARGIN_MS)
         );
-        const entry = { monitor: child, bean: latest, isFirstBeat: false, sendFn, announcesOutage: true, since };
+        const entry = { monitor: child, bean: latest, isFirstBeat: false, sendFn, announcesOutage: true, since, freshDowns: 0 };
         entry.timer = this.timers.setTimeout(() => this.fire(entry), delayMs);
         if (entry.timer.unref) {
             entry.timer.unref();
@@ -336,18 +355,43 @@ class NotificationQueue {
      * check, then sent once) instead of at the end of its wait.
      * @param {number} monitorId Monitor identifier
      * @param {object} bean The stored heartbeat
+     * @param {string} source "push" for a producer push, "check" for Kuma's own beat
      * @returns {Promise<void>}
      */
-    async freshBeat(monitorId, bean) {
+    async freshBeat(monitorId, bean, source) {
         const entry = this.pending.get(monitorId);
         if (!entry || entry.since === undefined || bean.status !== DOWN || !(String(bean.time) > String(entry.since))) {
             return;
+        }
+        if (entry.monitor.type === "push") {
+            // Only the producer decides a push child: Kuma's own "no heartbeat"
+            // tick inside the window is not evidence (the window's end is).
+            if (source !== "push") {
+                return;
+            }
+        } else {
+            // A checked child gets its own retries before a fresh DOWN counts,
+            // as a first DOWN outside a cascade would.
+            entry.freshDowns += 1;
+            if (entry.freshDowns < Math.max(0, Number(entry.monitor.maxretries) || 0) + 1) {
+                return;
+            }
         }
         this.timers.clearTimeout(entry.timer);
         // The triggering beat itself: re-querying could miss it where times
         // are stored at whole seconds (MariaDB DATETIME).
         entry.freshBean = bean;
         await this.fire(entry);
+    }
+
+    /**
+     * Whether a monitor is being re-checked after its parent's recovery, so
+     * its own checks run at its retry interval meanwhile.
+     * @param {number} monitorId Monitor identifier
+     * @returns {boolean} True while it waits for fresh beats
+     */
+    isRechecking(monitorId) {
+        return this.pending.get(monitorId)?.since !== undefined;
     }
 
     /**

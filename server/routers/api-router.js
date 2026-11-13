@@ -124,7 +124,7 @@ router.all("/api/push/:pushToken", async (request, response) => {
 
         await R.store(bean);
         // Not awaited: the push is answered once its beat is stored; this logs its own errors.
-        void notificationQueue.freshBeat(monitor.id, bean).then(() => monitor.recheckSuppressedChildren(bean));
+        void notificationQueue.freshBeat(monitor.id, bean, "push").then(() => monitor.recheckSuppressedChildren(bean));
 
         io.to(monitor.user_id).emit("heartbeat", bean.toJSON());
 
