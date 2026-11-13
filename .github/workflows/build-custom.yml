@@ -8,6 +8,9 @@ on:
   pull_request:
     paths:
       - "docker/**"
+      - "extra/download-apprise.mjs"
+      - ".npmrc"
+      - ".dockerignore"
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/build-custom.yml"
@@ -71,7 +74,7 @@ jobs:
           load: ${{ github.event_name != 'push' }}
           set: |
             *.cache-from=type=gha
-            *.cache-to=type=gha,mode=max
+            release.cache-to=type=gha,mode=max
             release.labels.org.opencontainers.image.source=https://github.com/${{ github.repository }}
             release.labels.org.opencontainers.image.revision=${{ github.sha }}
             ${{ steps.tags.outputs.set }}
@@ -83,15 +86,17 @@ jobs:
           image="${REGISTRY}/${IMAGE_NAME}:pr-check"
           mkdir -p "${RUNNER_TEMP}/kuma-data"
           echo '{"type":"sqlite"}' > "${RUNNER_TEMP}/kuma-data/db-config.json"
-          docker run --rm --entrypoint node "${image}" -e 'console.log(process.version, require("/app/package.json").version)'
+          docker run --rm --entrypoint node "${image}" -e '
+            console.log(process.version, require("/app/package.json").version);
+            if (!process.version.startsWith("v26.")) { process.exit(1); }'
           docker run -d --name kuma-check -p 127.0.0.1:3001:3001 -v "${RUNNER_TEMP}/kuma-data:/app/data" "${image}"
           for _ in $(seq 1 90); do
-            if curl -fsS 'http://127.0.0.1:3001/socket.io/?EIO=4&transport=polling' | grep -q '^0'; then
+            if curl -fsS --max-time 5 'http://127.0.0.1:3001/socket.io/?EIO=4&transport=polling' | grep -q '^0'; then
               echo "Kuma is serving"; docker rm -f kuma-check >/dev/null; exit 0
             fi
             sleep 2
           done
-          docker logs kuma-check | tail -50
+          docker logs kuma-check 2>&1 | tail -50
           exit 1
 
       - name: Record immutable image digest
