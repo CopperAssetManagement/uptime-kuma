@@ -362,4 +362,71 @@ describe("Push monitor", () => {
             }
         });
     });
+
+    test("a never-pushed monitor created more than one interval ago goes DOWN at its first check after a restart", async () => {
+        await withPushMonitor(
+            "never-pushed",
+            async (monitorID) => {
+                const monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
+                const started = Date.now();
+                try {
+                    await monitor.start(io);
+                    const rows = await waitFor(async () => (await heartbeats(monitorID)).length && heartbeats(monitorID), 5000, "the first check");
+                    assert.deepStrictEqual(rows.map((row) => row.status), [DOWN]);
+                    assert.ok(Date.now() - started < 5000, "the first check did not wait a full interval");
+                } finally {
+                    await monitor.stop();
+                }
+            },
+            {
+                interval: 3600,
+                maxretries: 0,
+                created_date: R.isoDateTime(dayjs.utc().subtract(2, "hour")),
+            }
+        );
+    });
+
+    test("schedules a push monitor's first check one interval after its last beat", () => {
+        const now = dayjs.utc("2026-11-12 12:00:00");
+        const delay = (reference) => Monitor.firstPushCheckDelay(60, reference, now);
+        assert.strictEqual(delay("2026-11-12 11:59:30.000"), 31000, "the remainder of the interval plus the buffer");
+        assert.strictEqual(delay("2026-11-12 11:58:00.000"), 1000, "an overdue push is checked at once");
+        assert.strictEqual(delay("2026-11-12 12:05:00.000"), 60000, "never more than one interval");
+        assert.strictEqual(delay(null), 60000, "an unknown reference waits one interval");
+    });
+
+    test("a pushed recovery whose DOWN was never delivered is not announced", async () => {
+        const parent = R.dispense("monitor");
+        Object.assign(parent, { name: "cascade-parent", type: "ping", active: false, user_id: userID, interval: 60 });
+        await R.store(parent);
+        const originalSend = Monitor.sendNotification;
+        const sent = [];
+        Monitor.sendNotification = async (_isFirstBeat, _monitor, bean) => {
+            sent.push(bean.status);
+        };
+        try {
+            await withPushMonitor(
+                "cascade-orphan-up",
+                async (monitorID) => {
+                    // Held for the parent check, then recovered before it: neither is announced.
+                    await seedHeartbeat(monitorID, UP, 0, { msg: "OK" });
+                    await push("cascade-orphan-up", "down");
+                    await push("cascade-orphan-up", "up");
+                    // Suppressed (the parent was DOWN), then recovered: the recovery is not announced.
+                    await push("cascade-orphan-up", "down");
+                    await R.exec("UPDATE monitor SET cascade_down_withheld = 'suppressed' WHERE id = ?", [monitorID]);
+                    await push("cascade-orphan-up", "up");
+                    assert.deepStrictEqual(sent, []);
+                    // An outage whose DOWN was delivered still announces its recovery.
+                    await push("cascade-orphan-up", "down");
+                    await R.exec("UPDATE monitor SET cascade_down_withheld = NULL WHERE id = ?", [monitorID]);
+                    await push("cascade-orphan-up", "up");
+                    assert.deepStrictEqual(sent, [UP]);
+                },
+                { parent: parent.id, suppressOnParentDown: true, maxretries: 0 }
+            );
+        } finally {
+            Monitor.sendNotification = originalSend;
+        }
+    });
 });

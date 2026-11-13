@@ -1985,8 +1985,8 @@ async function shutdownFunction(signal) {
 
     await server.stop();
 
-    log.info("server", "Flushing notification queue before shutdown");
-    await notificationQueue.flush();
+    // Send nothing held for a parent check; it resumes with that check on start.
+    notificationQueue.stop();
 
     log.info("server", "Stopping all monitors");
     for (let id in server.monitorList) {

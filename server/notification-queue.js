@@ -2,83 +2,94 @@ const { R } = require("redbean-node");
 const { log, DOWN } = require("../src/util");
 
 /**
+ * The monitor's persisted record of a DOWN notification that has not been
+ * delivered: QUEUED while it waits for the parent check, SUPPRESSED once the
+ * parent was found DOWN. NULL means there is no undelivered DOWN.
+ */
+const QUEUED = "queued";
+const SUPPRESSED = "suppressed";
+
+/**
  * Delayed notification queue for cascade suppression.
  *
- * When a child monitor with suppressOnParentDown=true goes DOWN,
- * the notification is held for a delay period. After the delay,
- * the parent's latest heartbeat is checked. If the parent is also
- * DOWN, the child notification is suppressed. Otherwise it sends.
+ * When a child monitor with suppressOnParentDown=true goes DOWN, the
+ * notification is held for the parent's interval plus a buffer. Then the
+ * parent's latest heartbeat is checked: if the parent is also DOWN, the child
+ * notification is suppressed, otherwise it is sent.
+ *
+ * Whether the outage's DOWN was delivered is persisted on the monitor row
+ * (monitor.cascade_down_withheld), so it survives a restart:
+ * - the recovery UP is sent only when its DOWN was delivered (no orphan "Up");
+ * - a shutdown sends nothing; a DOWN still waiting for its parent check is
+ *   resumed, with the parent check, when the monitor starts again.
  */
 class NotificationQueue {
 
-    /** Create an empty delayed-notification queue. */
-    constructor() {
-        /** @type {Map<number, {timer: NodeJS.Timeout, monitor: object, bean: object, isFirstBeat: boolean}>} */
+    /**
+     * Create an empty delayed-notification queue.
+     * @param {{setTimeout: Function, clearTimeout: Function}} timers Timer functions (tests substitute their own)
+     */
+    constructor(timers = globalThis) {
+        this.timers = timers;
+        /** @type {Map<number, {timer: NodeJS.Timeout, monitor: object, bean: object, isFirstBeat: boolean, sendFn: Function, announcesOutage: boolean}>} */
         this.pending = new Map();
     }
 
     /**
-     * Enqueue a notification for delayed sending with parent check.
+     * Hold a DOWN notification for a delayed parent check.
      * Only one pending notification per monitor — newer replaces older.
      * @param {object} monitor The child monitor instance
      * @param {object} bean The heartbeat bean
      * @param {boolean} isFirstBeat Whether this is the first beat
      * @param {Function} sendFn The function to call if notification should send: (isFirstBeat, monitor, bean) => Promise<void>
      * @param {number} parentInterval Parent monitor interval in seconds
+     * @param {boolean} announcesOutage True for the outage's first DOWN, false for a resend
      * @throws {TypeError} When the parent interval is not a positive number
-     * @returns {void}
+     * @returns {Promise<void>}
      */
-    enqueue(monitor, bean, isFirstBeat, sendFn, parentInterval) {
+    async enqueue(monitor, bean, isFirstBeat, sendFn, parentInterval, announcesOutage = true) {
         if (!Number.isFinite(parentInterval) || parentInterval <= 0) {
             throw new TypeError(`Invalid parent interval for monitor ${monitor.id}: ${parentInterval}`);
         }
 
-        // Cancel any existing pending notification for this monitor
-        this.cancel(monitor.id);
+        // A resend that replaces a still-pending first DOWN still announces the outage.
+        const replaced = this.pending.get(monitor.id);
+        announcesOutage = announcesOutage || Boolean(replaced?.announcesOutage);
+        this.clearTimer(monitor.id);
+
+        if (announcesOutage) {
+            await setWithheld(monitor.id, QUEUED);
+        }
 
         // Calculate delay: parent's interval + 5s buffer, minimum 10s
         const delayMs = Math.max(10000, parentInterval * 1000 + 5000);
 
         log.info("notification-queue", `[${monitor.name}] Queuing notification for ${delayMs}ms (parent interval: ${parentInterval}s)`);
 
-        const timer = setTimeout(async () => {
+        const entry = { monitor, bean, isFirstBeat, sendFn, announcesOutage };
+        entry.timer = this.timers.setTimeout(async () => {
             this.pending.delete(monitor.id);
-            await this.resolve(monitor, bean, isFirstBeat, sendFn);
+            try {
+                await this.resolve(entry);
+            } catch (e) {
+                log.error("notification-queue", `[${monitor.name}] Delayed notification failed: ${e.message}`);
+            }
         }, delayMs);
 
         // Don't let the timer prevent Node.js from exiting
-        if (timer.unref) {
-            timer.unref();
+        if (entry.timer.unref) {
+            entry.timer.unref();
         }
 
-        this.pending.set(monitor.id, { timer, monitor, bean, isFirstBeat, sendFn });
+        this.pending.set(monitor.id, entry);
     }
 
     /**
-     * Cancel a delayed notification after the child monitor recovers.
-     * @param {number} monitorId Child monitor identifier
-     * @returns {boolean} Whether a pending notification was cancelled
-     */
-    cancel(monitorId) {
-        const entry = this.pending.get(monitorId);
-        if (!entry) {
-            return false;
-        }
-        clearTimeout(entry.timer);
-        this.pending.delete(monitorId);
-        log.info("notification-queue", `[${entry.monitor.name}] Cancelled delayed notification`);
-        return true;
-    }
-
-    /**
-     * Resolve a pending notification by checking parent status.
-     * @param {object} monitor The child monitor
-     * @param {object} bean The heartbeat bean
-     * @param {boolean} isFirstBeat Whether this is the first beat
-     * @param {Function} sendFn The send function
+     * Resolve a held notification by checking the parent's latest status.
+     * @param {{monitor: object, bean: object, isFirstBeat: boolean, sendFn: Function, announcesOutage: boolean}} entry Held notification
      * @returns {Promise<void>}
      */
-    async resolve(monitor, bean, isFirstBeat, sendFn) {
+    async resolve({ monitor, bean, isFirstBeat, sendFn, announcesOutage }) {
         let parentHeartbeat;
         try {
             parentHeartbeat = await R.getRow(
@@ -87,46 +98,107 @@ class NotificationQueue {
             );
         } catch (e) {
             log.error("notification-queue", `[${monitor.name}] Parent status could not be read; sending without suppression: ${e.message}`);
-            await sendFn(isFirstBeat, monitor, bean);
+            await this.deliver(monitor, bean, isFirstBeat, sendFn);
             return;
         }
 
         if (parentHeartbeat && parentHeartbeat.status === DOWN) {
             log.info("notification-queue", `[${monitor.name}] Notification SUPPRESSED: parent [#${monitor.parent}] is DOWN`);
+            if (announcesOutage) {
+                await setWithheld(monitor.id, SUPPRESSED);
+            }
             return;
         }
 
         // Parent is UP or PENDING or has no heartbeat — send the notification.
-        // This call intentionally sits outside the database catch above: a
-        // delivery failure must propagate once, never be retried as though the
-        // parent lookup had failed and never be reduced to a log line.
         log.info("notification-queue", `[${monitor.name}] Parent is not DOWN, sending delayed notification`);
-        await sendFn(isFirstBeat, monitor, bean);
+        await this.deliver(monitor, bean, isFirstBeat, sendFn);
     }
 
     /**
-     * Flush all pending notifications immediately (used on shutdown).
-     * Sends all queued notifications without checking parent status.
+     * Send a DOWN notification, then record that the outage was announced.
+     * A delivery failure propagates once and leaves the outage unannounced.
+     * @param {object} monitor The child monitor
+     * @param {object} bean The heartbeat bean
+     * @param {boolean} isFirstBeat Whether this is the first beat
+     * @param {Function} sendFn The send function
      * @returns {Promise<void>}
      */
-    async flush() {
-        log.info("notification-queue", `Flushing ${this.pending.size} pending notification(s)`);
-        const entries = Array.from(this.pending.values());
-        this.pending.clear();
+    async deliver(monitor, bean, isFirstBeat, sendFn) {
+        await sendFn(isFirstBeat, monitor, bean);
+        await setWithheld(monitor.id, null);
+    }
 
-        const failures = [];
-        for (const entry of entries) {
-            clearTimeout(entry.timer);
-            try {
-                await entry.sendFn(entry.isFirstBeat, entry.monitor, entry.bean);
-            } catch (e) {
-                log.error("notification-queue", `Failed to flush notification for [${entry.monitor.name}]: ${e.message}`);
-                failures.push(new Error(`Failed to flush notification for monitor ${entry.monitor.id}`, { cause: e }));
-            }
+    /**
+     * The child left DOWN: cancel any held notification and settle the outage.
+     * @param {number} monitorId Child monitor identifier
+     * @returns {Promise<boolean>} True when the outage's DOWN was never delivered,
+     * so its recovery must not be announced either
+     */
+    async recover(monitorId) {
+        if (this.clearTimer(monitorId)) {
+            log.info("notification-queue", `[#${monitorId}] Cancelled delayed notification`);
         }
-        if (failures.length) {
-            throw new AggregateError(failures, `${failures.length} delayed notification(s) failed during flush`);
+        const withheld = await R.getCell("SELECT cascade_down_withheld FROM monitor WHERE id = ?", [monitorId]);
+        if (withheld) {
+            await setWithheld(monitorId, null);
         }
+        return Boolean(withheld);
+    }
+
+    /**
+     * Resume a DOWN that was still waiting for its parent check when the
+     * monitor last stopped (e.g. a restart), so it is neither lost nor sent
+     * without the check.
+     * @param {object} monitor The child monitor instance, starting
+     * @param {Function} sendFn The send function
+     * @param {number} parentInterval Parent monitor interval in seconds
+     * @returns {Promise<void>}
+     */
+    async resume(monitor, sendFn, parentInterval) {
+        if (this.pending.has(monitor.id)) {
+            return;
+        }
+        const withheld = await R.getCell("SELECT cascade_down_withheld FROM monitor WHERE id = ?", [monitor.id]);
+        if (withheld !== QUEUED) {
+            return;
+        }
+        const latest = await R.findOne("heartbeat", " monitor_id = ? ORDER BY time DESC ", [monitor.id]);
+        if (!latest || latest.status !== DOWN) {
+            // It recovered while stopped; its DOWN was never delivered, so stays withheld
+            // until the next beat settles it (recover()).
+            return;
+        }
+        log.info("notification-queue", `[${monitor.name}] Resuming a DOWN notification held before the last stop`);
+        await this.enqueue(monitor, latest, false, sendFn, parentInterval, true);
+    }
+
+    /**
+     * Stop every timer without sending (used on shutdown). Held DOWNs stay
+     * recorded as queued and are resumed with their parent check on start.
+     * @returns {void}
+     */
+    stop() {
+        log.info("notification-queue", `Stopping with ${this.pending.size} held notification(s); they resume on start`);
+        for (const entry of this.pending.values()) {
+            this.timers.clearTimeout(entry.timer);
+        }
+        this.pending.clear();
+    }
+
+    /**
+     * Clear a monitor's pending timer.
+     * @param {number} monitorId Child monitor identifier
+     * @returns {boolean} Whether a pending notification was cleared
+     */
+    clearTimer(monitorId) {
+        const entry = this.pending.get(monitorId);
+        if (!entry) {
+            return false;
+        }
+        this.timers.clearTimeout(entry.timer);
+        this.pending.delete(monitorId);
+        return true;
     }
 
     /**
@@ -138,10 +210,22 @@ class NotificationQueue {
     }
 }
 
+/**
+ * Persist the monitor's undelivered-DOWN state.
+ * @param {number} monitorId Monitor identifier
+ * @param {(string|null)} state QUEUED, SUPPRESSED or null
+ * @returns {Promise<void>}
+ */
+async function setWithheld(monitorId, state) {
+    await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [state, monitorId]);
+}
+
 // Singleton instance
 const notificationQueue = new NotificationQueue();
 
 module.exports = {
     notificationQueue,
     NotificationQueue,
+    QUEUED,
+    SUPPRESSED,
 };
