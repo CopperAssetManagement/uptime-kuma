@@ -1077,6 +1077,7 @@ class Monitor extends BeanModel {
             // Store to database
             log.debug("monitor", `[${this.name}] Store`);
             await R.store(bean);
+            await notificationQueue.freshBeat(this.id, bean);
             await this.recheckSuppressedChildren(bean);
 
             log.debug("monitor", `[${this.name}] prometheus.update`);
@@ -1248,7 +1249,7 @@ class Monitor extends BeanModel {
             return;
         }
         try {
-            await notificationQueue.reannounceChildren(this, Monitor.sendNotification, (id) => Monitor.runningOrStored(id));
+            await notificationQueue.reannounceChildren(this, Monitor.sendNotification, (id) => Monitor.runningOrStored(id), bean.time);
         } catch (e) {
             log.error("monitor", `[${this.name}] Could not re-check its children's suppressed DOWNs: ${e.message}`);
         }
