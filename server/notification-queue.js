@@ -191,6 +191,38 @@ class NotificationQueue {
     }
 
     /**
+     * The parent came UP: re-queue each opted-in child whose DOWN was
+     * suppressed and which is still DOWN, through the parent check, so it is
+     * sent once (or suppressed again if the parent is DOWN by then).
+     * @param {object} parent The parent monitor that came UP
+     * @param {Function} sendFn The send function
+     * @param {Function} monitorById Returns a child monitor instance by id
+     * @returns {Promise<void>}
+     */
+    async reannounceChildren(parent, sendFn, monitorById) {
+        const children = await R.getCol(
+            "SELECT id FROM monitor WHERE parent = ? AND active = 1 AND suppress_on_parent_down = 1 AND cascade_down_withheld = ?",
+            [parent.id, SUPPRESSED]
+        );
+        for (const id of children) {
+            if (this.pending.has(id) || this.inflight.has(id)) {
+                continue;
+            }
+            const latest = await R.findOne("heartbeat", " monitor_id = ? ORDER BY time DESC ", [id]);
+            if (!latest || latest.status !== DOWN) {
+                // Not DOWN any more: its own recovery settles it, unannounced.
+                continue;
+            }
+            const child = await monitorById(id);
+            if (!child) {
+                continue;
+            }
+            log.info("notification-queue", `[${child.name}] Parent [${parent.name}] is UP; re-checking its suppressed DOWN`);
+            await this.enqueue(child, latest, false, sendFn, parent.interval, true);
+        }
+    }
+
+    /**
      * Resume a DOWN that was still waiting for its parent check when the
      * monitor last stopped (e.g. a restart), so it is neither lost nor sent
      * without the check.

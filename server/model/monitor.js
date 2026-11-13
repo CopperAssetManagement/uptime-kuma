@@ -1225,12 +1225,34 @@ class Monitor extends BeanModel {
 
     /**
      * On an important beat that leaves DOWN, settle any held cascade notification.
+     * When this monitor comes UP, children whose DOWN was suppressed while it
+     * was DOWN, and which are still DOWN, get that DOWN re-queued through the
+     * parent check, so an outage that outlasts its parent's is still announced.
      * Both the monitor's own checks and the push route call this.
      * @param {import("./heartbeat")} bean The important heartbeat
      * @returns {Promise<boolean>} True when the outage's DOWN was never delivered
      */
     async settleHeldDown(bean) {
+        if (bean.status === UP) {
+            try {
+                await notificationQueue.reannounceChildren(this, Monitor.sendNotification, (id) =>
+                    Monitor.runningOrStored(id)
+                );
+            } catch (e) {
+                log.error("monitor", `[${this.name}] Could not re-check its children's suppressed DOWNs: ${e.message}`);
+            }
+        }
         return bean.status !== DOWN && (await notificationQueue.recover(this.id));
+    }
+
+    /**
+     * A monitor as the running server holds it, or as stored when it is not running.
+     * @param {number} id Monitor identifier
+     * @returns {Promise<(Monitor|null)>} The monitor
+     */
+    static async runningOrStored(id) {
+        const running = UptimeKumaServer.getInstance().monitorList?.[id];
+        return running ?? (await R.findOne("monitor", " id = ? ", [id]));
     }
 
     /**

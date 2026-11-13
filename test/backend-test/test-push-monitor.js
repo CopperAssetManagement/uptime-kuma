@@ -460,4 +460,29 @@ describe("Push monitor", () => {
             Monitor.sendNotification = originalSend;
         }
     });
+
+    test("a parent pushed back UP re-checks its still-DOWN child's suppressed DOWN", async () => {
+        const { notificationQueue } = require("../../server/notification-queue");
+        await withPushMonitor("reannounce-parent", async (parentID) => {
+            await withPushMonitor(
+                "reannounce-child",
+                async (childID) => {
+                    await seedHeartbeat(parentID, DOWN, 0);
+                    await seedHeartbeat(childID, DOWN, 0);
+                    await R.exec("UPDATE monitor SET cascade_down_withheld = 'suppressed' WHERE id = ?", [childID]);
+                    try {
+                        await push("reannounce-parent", "up");
+                        assert.strictEqual(
+                            await R.getCell("SELECT cascade_down_withheld FROM monitor WHERE id = ?", [childID]),
+                            "queued"
+                        );
+                        assert.ok(notificationQueue.pending.has(childID), "held again for the parent check");
+                    } finally {
+                        notificationQueue.clearTimer(childID);
+                    }
+                },
+                { parent: parentID, suppressOnParentDown: true, maxretries: 0 }
+            );
+        }, { maxretries: 0 });
+    });
 });

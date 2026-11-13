@@ -265,6 +265,52 @@ describe("NotificationQueue", () => {
         assert.equal(await withheld(), null);
     });
 
+    test("a parent coming UP re-checks a still-DOWN child's suppressed DOWN and sends it once", async () => {
+        await beat(CHILD, DOWN);
+        await beat(PARENT, UP);
+        await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [SUPPRESSED, CHILD]);
+        const { queue, timers } = manual();
+        const send = counter();
+        await queue.reannounceChildren({ id: PARENT, name: "parent", interval: 60 }, send, async (id) => ({ ...child(), id }));
+        assert.equal(queue.size, 1);
+        assert.equal(timers[0].delay, 65000, "through the usual parent check");
+        assert.equal(await withheld(), QUEUED);
+        await timers[0].fire();
+        assert.equal(send.calls, 1);
+        assert.equal(await withheld(), null);
+    });
+
+    test("a re-checked DOWN is suppressed again if the parent is DOWN by then", async () => {
+        await beat(CHILD, DOWN);
+        await beat(PARENT, DOWN);
+        await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [SUPPRESSED, CHILD]);
+        const { queue, timers } = manual();
+        const send = counter();
+        await queue.reannounceChildren({ id: PARENT, name: "parent", interval: 60 }, send, async (id) => ({ ...child(), id }));
+        await timers[0].fire();
+        assert.equal(send.calls, 0);
+        assert.equal(await withheld(), SUPPRESSED);
+    });
+
+    test("a parent coming UP leaves alone children that recovered, were announced, or are already held", async () => {
+        const { queue } = manual();
+        const lookup = async (id) => ({ ...child(), id });
+        await beat(CHILD, UP);
+        await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [SUPPRESSED, CHILD]);
+        await queue.reannounceChildren({ id: PARENT, name: "parent", interval: 60 }, counter(), lookup);
+        assert.equal(queue.size, 0, "recovered: its own recovery settles it");
+
+        await beat(CHILD, DOWN, "2026-11-12 12:05:00.000");
+        await R.exec("UPDATE monitor SET cascade_down_withheld = NULL WHERE id = ?", [CHILD]);
+        await queue.reannounceChildren({ id: PARENT, name: "parent", interval: 60 }, counter(), lookup);
+        assert.equal(queue.size, 0, "announced: nothing to re-send");
+
+        await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [SUPPRESSED, CHILD]);
+        await queue.enqueue(child(), { status: DOWN }, false, counter(), 60, false);
+        await queue.reannounceChildren({ id: PARENT, name: "parent", interval: 60 }, counter(), lookup);
+        assert.equal(queue.size, 1, "already held: not queued twice");
+    });
+
     test("fails open exactly once when parent status cannot be read", async (t) => {
         const original = R.getRow;
         t.after(() => {
