@@ -4,7 +4,7 @@ const { after, before, beforeEach, describe, test } = require("node:test");
 const assert = require("node:assert/strict");
 const { R } = require("redbean-node");
 const { DOWN, UP, PENDING, MAINTENANCE } = require("../../src/util");
-const { NotificationQueue, QUEUED, SUPPRESSED } = require("../../server/notification-queue");
+const { NotificationQueue, QUEUED, SUPPRESSED, RECHECKING } = require("../../server/notification-queue");
 const { Settings } = require("../../server/settings");
 const TestDB = require("../mock-testdb");
 
@@ -277,7 +277,7 @@ describe("NotificationQueue", () => {
         const send = counter();
         await queue.reannounceChildren({ id: PARENT, name: "parent", interval: 60 }, send, slowChild, RECOVERED);
         assert.equal(timers[0].delay, 360000, "waits up to the child's own interval plus a margin");
-        assert.equal(await withheld(), QUEUED);
+        assert.equal(await withheld(), RECHECKING);
         await beat(CHILD, DOWN, FRESH);
         await queue.freshBeat(CHILD, { status: DOWN, time: FRESH });
         assert.equal(send.calls, 1);
@@ -324,6 +324,36 @@ describe("NotificationQueue", () => {
         await queue.freshBeat(CHILD, { status: DOWN, time: FRESH });
         assert.equal(send.calls, 0);
         assert.equal(await withheld(), SUPPRESSED);
+    });
+
+    test("a restart during a re-check waits for a fresh beat again instead of sending the stale DOWN", async () => {
+        await beat(CHILD, DOWN);
+        await R.knex("heartbeat").insert({ monitor_id: PARENT, status: UP, time: RECOVERED, msg: "", important: 1 });
+        await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [RECHECKING, CHILD]);
+        const { queue, timers } = manual();
+        const send = counter();
+        await queue.resume({ ...child(), interval: 300 }, send, 60);
+        assert.equal(queue.size, 1);
+        assert.equal(timers[0].delay, 360000);
+        await timers[0].fire();
+        assert.equal(send.calls, 0, "only the stale DOWN: nothing is sent");
+        assert.equal(await withheld(), SUPPRESSED);
+
+        // Resumed again, then a fresh DOWN after the recovery: sent once.
+        await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [RECHECKING, CHILD]);
+        const { queue: resumed } = manual();
+        await resumed.resume({ ...child(), interval: 300 }, send, 60);
+        await beat(CHILD, DOWN, FRESH);
+        await resumed.freshBeat(CHILD, { status: DOWN, time: FRESH, monitor_id: CHILD, msg: "" });
+        assert.equal(send.calls, 1);
+    });
+
+    test("a re-check's wait never overflows Node's timer", async () => {
+        await beat(CHILD, DOWN);
+        await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [SUPPRESSED, CHILD]);
+        const { queue, timers } = manual();
+        await queue.reannounceChildren({ id: PARENT, name: "parent", interval: 60 }, counter(), async (id) => ({ ...child(), id, interval: 40 * 86400 }), RECOVERED);
+        assert.equal(timers[0].delay, 2147483647);
     });
 
     test("a beat older than the parent's recovery does not resolve a re-check", async () => {

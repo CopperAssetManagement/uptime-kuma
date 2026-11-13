@@ -484,9 +484,9 @@ describe("Push monitor", () => {
                         assert.deepStrictEqual(parentStatusAtRecheck, [UP], "children are re-checked after the parent's UP is stored");
                         assert.strictEqual(
                             await R.getCell("SELECT cascade_down_withheld FROM monitor WHERE id = ?", [childID]),
-                            "queued"
+                            "rechecking"
                         );
-                        assert.ok(notificationQueue.pending.has(childID), "held again for the parent check");
+                        assert.ok(notificationQueue.pending.has(childID), "held again until a fresh beat");
                     } finally {
                         Monitor.runningOrStored = originalLookup;
                         notificationQueue.clearTimer(childID);
