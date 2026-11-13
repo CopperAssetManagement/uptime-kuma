@@ -480,6 +480,7 @@ describe("Push monitor", () => {
                     };
                     try {
                         await push("reannounce-parent", "up");
+                        await waitFor(() => parentStatusAtRecheck.length && notificationQueue.pending.has(childID), 5000, "the children's re-check");
                         assert.deepStrictEqual(parentStatusAtRecheck, [UP], "children are re-checked after the parent's UP is stored");
                         assert.strictEqual(
                             await R.getCell("SELECT cascade_down_withheld FROM monitor WHERE id = ?", [childID]),

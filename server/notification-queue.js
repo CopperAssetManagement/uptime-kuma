@@ -220,8 +220,10 @@ class NotificationQueue {
      */
     async reannounceChildren(parent, sendFn, monitorById) {
         const children = await R.getCol(
-            "SELECT id FROM monitor WHERE parent = ? AND active = 1 AND suppress_on_parent_down = 1 AND cascade_down_withheld = ?",
-            [parent.id, SUPPRESSED]
+            // Any recorded state: the atomic claim in reannounce() decides, so a
+            // child whose state settles to SUPPRESSED meanwhile is not missed.
+            "SELECT id FROM monitor WHERE parent = ? AND active = 1 AND suppress_on_parent_down = 1 AND cascade_down_withheld IS NOT NULL",
+            [parent.id]
         );
         for (const id of children) {
             try {
