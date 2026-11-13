@@ -97,13 +97,13 @@ router.all("/api/push/:pushToken", async (request, response) => {
         log.debug("router", "Current Status: " + bean.status);
 
         bean.important = Monitor.isImportantBeat(isFirstBeat, previousHeartbeat?.status, bean.status);
+        const downWithheld = bean.important && (await monitor.settleHeldDown(bean));
 
         if (Monitor.isImportantForNotification(isFirstBeat, previousHeartbeat?.status, bean.status)) {
             // Reset down count
             bean.downCount = 0;
 
-            log.debug("monitor", `[${monitor.name}] sendNotification`);
-            await Monitor.sendNotification(isFirstBeat, monitor, bean);
+            await monitor.notifyStatusChange(isFirstBeat, bean, downWithheld);
         } else {
             if (bean.status === DOWN && monitor.resendInterval > 0) {
                 ++bean.downCount;
@@ -113,7 +113,7 @@ router.all("/api/push/:pushToken", async (request, response) => {
                         "monitor",
                         `[${monitor.name}] sendNotification again: Down Count: ${bean.downCount} | Resend Interval: ${monitor.resendInterval}`
                     );
-                    await Monitor.sendNotification(isFirstBeat, monitor, bean);
+                    await monitor.notifyStillDown(isFirstBeat, bean);
 
                     // Reset down count
                     bean.downCount = 0;

@@ -8,6 +8,8 @@ console.log("Welcome to Uptime Kuma");
 // As the log function need to use dayjs, it should be very top
 const dayjs = require("dayjs");
 dayjs.extend(require("dayjs/plugin/utc"));
+// When this process started: monitors measure Kuma's downtime up to it.
+const processStartedAt = dayjs.utc();
 dayjs.extend(require("./modules/dayjs/plugin/timezone"));
 dayjs.extend(require("dayjs/plugin/customParseFormat"));
 
@@ -1958,13 +1960,22 @@ async function pauseMonitor(userID, monitorID) {
 async function startMonitors() {
     let list = await R.find("monitor", " active = 1 ");
 
+    // How long Kuma was not running: from its newest heartbeat before this
+    // process started. A push monitor whose push came due meanwhile is first
+    // checked at the job's next expected push, not at once.
+    const lastHeartbeat = await R.getCell("SELECT MAX(time) FROM heartbeat WHERE time < ?", [
+        R.isoDateTimeMillis(processStartedAt),
+    ]);
+    const stoppedAtMs = lastHeartbeat ? dayjs.utc(lastHeartbeat).valueOf() : processStartedAt.valueOf();
+    log.info("server", `Starting monitors; Kuma stopped about ${Math.round((processStartedAt.valueOf() - stoppedAtMs) / 1000)}s before this start`);
+
     for (let monitor of list) {
         server.monitorList[monitor.id] = monitor;
     }
 
     for (let monitor of list) {
         try {
-            await monitor.start(io);
+            await monitor.start(io, { stoppedAtMs });
         } catch (e) {
             log.error("monitor", e);
         }
@@ -1985,14 +1996,14 @@ async function shutdownFunction(signal) {
 
     await server.stop();
 
-    log.info("server", "Flushing notification queue before shutdown");
-    await notificationQueue.flush();
-
     log.info("server", "Stopping all monitors");
     for (let id in server.monitorList) {
         let monitor = server.monitorList[id];
         await monitor.stop();
     }
+
+    // Send nothing held for a parent check; it resumes with that check on start.
+    await notificationQueue.stop();
     await sleep(2000);
     await Database.close();
 

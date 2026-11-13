@@ -420,9 +420,10 @@ class Monitor extends BeanModel {
     /**
      * Start monitor
      * @param {Server} io Socket server instance
+     * @param {{stoppedAtMs?: number}} options At server start: when Kuma last stopped (epoch ms)
      * @returns {Promise<void>}
      */
-    async start(io) {
+    async start(io, options = {}) {
         let previousBeat = null;
         let retries = 0;
 
@@ -779,7 +780,9 @@ class Monitor extends BeanModel {
                             // No need to insert successful heartbeat for push type, so end here
                             retries = 0;
                             log.debug("monitor", `[${this.name}] timeout = ${timeout}`);
-                            this.heartbeatInterval = setTimeout(safeBeat, Math.min(timeout, MAX_TIMEOUT_MS));
+                            if (!this.isStop) {
+                                this.heartbeatInterval = setTimeout(safeBeat, Math.min(timeout, MAX_TIMEOUT_MS));
+                            }
                             return;
                         }
                     } else {
@@ -976,24 +979,10 @@ class Monitor extends BeanModel {
             if (isImportant) {
                 bean.important = true;
 
-                if (bean.status !== DOWN) {
-                    notificationQueue.cancel(this.id);
-                }
+                const downWithheld = await this.settleHeldDown(bean);
 
                 if (Monitor.isImportantForNotification(isFirstBeat, previousBeat?.status, bean.status)) {
-                    if (this.suppressOnParentDown && this.parent && bean.status === DOWN) {
-                        log.debug("monitor", `[${this.name}] Queuing notification (cascade suppression enabled)`);
-                        const parentRow = await R.getRow("SELECT `interval` FROM monitor WHERE id = ?", [this.parent]);
-                        if (!parentRow) {
-                            log.warn("monitor", `[${this.name}] Parent monitor ${this.parent} is absent; sending without suppression`);
-                            await Monitor.sendNotification(isFirstBeat, this, bean);
-                        } else {
-                            notificationQueue.enqueue(this, bean, isFirstBeat, Monitor.sendNotification, parentRow.interval);
-                        }
-                    } else {
-                        log.debug("monitor", `[${this.name}] sendNotification`);
-                        await Monitor.sendNotification(isFirstBeat, this, bean);
-                    }
+                    await this.notifyStatusChange(isFirstBeat, bean, downWithheld);
                 } else {
                     log.debug(
                         "monitor",
@@ -1016,22 +1005,11 @@ class Monitor extends BeanModel {
                     ++bean.downCount;
                     if (bean.downCount >= this.resendInterval) {
                         // Send notification again, because we are still DOWN
-                        if (this.suppressOnParentDown && this.parent) {
-                            log.debug("monitor", `[${this.name}] Queuing resend notification (cascade suppression enabled)`);
-                            const parentRow = await R.getRow("SELECT `interval` FROM monitor WHERE id = ?", [this.parent]);
-                            if (!parentRow) {
-                                log.warn("monitor", `[${this.name}] Parent monitor ${this.parent} is absent; sending without suppression`);
-                                await Monitor.sendNotification(isFirstBeat, this, bean);
-                            } else {
-                                notificationQueue.enqueue(this, bean, isFirstBeat, Monitor.sendNotification, parentRow.interval);
-                            }
-                        } else {
-                            log.debug(
-                                "monitor",
-                                `[${this.name}] sendNotification again: Down Count: ${bean.downCount} | Resend Interval: ${this.resendInterval}`
-                            );
-                            await Monitor.sendNotification(isFirstBeat, this, bean);
-                        }
+                        log.debug(
+                            "monitor",
+                            `[${this.name}] sendNotification again: Down Count: ${bean.downCount} | Resend Interval: ${this.resendInterval}`
+                        );
+                        await this.notifyStillDown(isFirstBeat, bean);
 
                         // Reset down count
                         bean.downCount = 0;
@@ -1140,14 +1118,177 @@ class Monitor extends BeanModel {
             }
         };
 
-        // Delay Push Type
+        // A DOWN still waiting for its parent check at the last stop resumes now.
+        // Cascade bookkeeping must never keep the monitor from running.
+        if (this.suppressOnParentDown && this.parent) {
+            try {
+                const parentInterval = await this.getParentInterval();
+                if (parentInterval !== null) {
+                    await notificationQueue.resume(this, Monitor.sendNotification, parentInterval);
+                }
+            } catch (e) {
+                log.error("monitor", `[${this.name}] Could not resume a held DOWN notification: ${e.message}`);
+            }
+        }
+
+        // Delay Push Type. At server start (options.stoppedAtMs given), the first
+        // check falls one interval after the last beat (or creation, if never
+        // pushed), extended by the time Kuma was not running, so a restart neither
+        // postpones a missed push nor alerts on a push lost while Kuma was down.
+        // Resuming or editing a monitor keeps upstream's full interval of grace.
         if (this.type === "push") {
-            this.heartbeatInterval = setTimeout(() => {
-                safeBeat();
-            }, Math.min(this.interval * 1000, MAX_TIMEOUT_MS));
+            let delay = this.interval * 1000;
+            if (options.stoppedAtMs !== undefined) {
+                try {
+                    const elapsedMs = await this.msSinceLastPushReference();
+                    // Measured to this monitor's own start, like elapsedMs.
+                    const downtimeMs = Math.max(0, Date.now() - options.stoppedAtMs);
+                    delay = Monitor.firstPushCheckDelay(this.interval, elapsedMs, downtimeMs);
+                } catch (e) {
+                    log.error("monitor", `[${this.name}] Could not read its last beat; first check in one interval: ${e.message}`);
+                }
+            }
+            log.debug("monitor", `[${this.name}] First push check in ${delay}ms`);
+            if (!this.isStop) {
+                this.heartbeatInterval = setTimeout(() => {
+                    safeBeat();
+                }, Math.min(delay, MAX_TIMEOUT_MS));
+            }
         } else {
             safeBeat();
         }
+    }
+
+    /**
+     * Time since a push monitor's last heartbeat, or since its creation when it
+     * has none.
+     * @returns {Promise<(number|null)>} Milliseconds, or null when unknown
+     */
+    async msSinceLastPushReference() {
+        const row = await R.getRow(
+            "SELECT (SELECT MAX(time) FROM heartbeat WHERE monitor_id = ?) AS last_beat, created_date, CURRENT_TIMESTAMP AS db_now FROM monitor WHERE id = ?",
+            [this.id, this.id]
+        );
+        if (row?.last_beat) {
+            // Heartbeat times are written in UTC.
+            return dayjs.utc().valueOf() - dayjs.utc(row.last_beat).valueOf();
+        }
+        if (row?.created_date && row?.db_now) {
+            // created_date is the database's own clock and zone; compare it with the same.
+            return dayjs.utc(row.db_now).valueOf() - dayjs.utc(row.created_date).valueOf();
+        }
+        return null;
+    }
+
+    /**
+     * Delay before a push monitor's first check when Kuma starts.
+     *
+     * With the deadline one interval after the reference (last beat, or
+     * creation) and Kuma stopped downtimeMs before this start:
+     * - deadline still ahead: check at the deadline;
+     * - deadline passed while Kuma was down (a push may have been lost): check
+     *   at the next push the job is expected to make;
+     * - deadline passed before Kuma stopped (already overdue): check at once.
+     * @param {number} intervalSeconds Monitor interval in seconds
+     * @param {(number|null)} elapsedMs Time since its last beat, or creation
+     * @param {number} downtimeMs How long Kuma was not running before this start
+     * @returns {number} Milliseconds including the push check's 1s buffer; one
+     * interval when the reference is unknown
+     */
+    static firstPushCheckDelay(intervalSeconds, elapsedMs, downtimeMs) {
+        const bufferTime = 1000;
+        const intervalMs = intervalSeconds * 1000;
+        if (!Number.isFinite(elapsedMs) || intervalMs <= 0) {
+            return intervalMs;
+        }
+        const elapsed = Math.max(0, elapsedMs);
+        const downtime = Number.isFinite(downtimeMs) && downtimeMs > 0 ? Math.min(downtimeMs, elapsed) : 0;
+        const untilDeadline = intervalMs - elapsed;
+        if (untilDeadline > 0) {
+            return untilDeadline + bufferTime;
+        }
+        if (untilDeadline > -downtime) {
+            const untilNextPush = Math.ceil(elapsed / intervalMs) * intervalMs - elapsed;
+            return untilNextPush + bufferTime;
+        }
+        return bufferTime;
+    }
+
+    /**
+     * The parent monitor's interval, or null when the parent is absent.
+     * @returns {Promise<(number|null)>} Interval in seconds
+     */
+    async getParentInterval() {
+        const parentRow = await R.getRow("SELECT `interval` FROM monitor WHERE id = ?", [this.parent]);
+        return parentRow ? parentRow.interval : null;
+    }
+
+    /**
+     * On an important beat that leaves DOWN, settle any held cascade notification.
+     * Both the monitor's own checks and the push route call this.
+     * @param {import("./heartbeat")} bean The important heartbeat
+     * @returns {Promise<boolean>} True when the outage's DOWN was never delivered
+     */
+    async settleHeldDown(bean) {
+        return bean.status !== DOWN && (await notificationQueue.recover(this.id));
+    }
+
+    /**
+     * Notify a status change, through cascade suppression where the monitor opts in.
+     * Both the monitor's own checks and the push route call this.
+     * @param {boolean} isFirstBeat Whether this is the first beat
+     * @param {import("./heartbeat")} bean The heartbeat
+     * @param {boolean} downWithheld From settleHeldDown: the outage's DOWN was never delivered
+     * @returns {Promise<void>}
+     */
+    async notifyStatusChange(isFirstBeat, bean, downWithheld) {
+        if (downWithheld) {
+            // A recovery whose DOWN was never delivered is not announced either.
+            log.info("monitor", `[${this.name}] Not announcing this change: its DOWN notification was never delivered`);
+        } else if (this.suppressOnParentDown && this.parent && bean.status === DOWN) {
+            await this.sendCascadeDownNotification(isFirstBeat, bean, true);
+        } else {
+            log.debug("monitor", `[${this.name}] sendNotification`);
+            await Monitor.sendNotification(isFirstBeat, this, bean);
+            if (bean.status === DOWN) {
+                // This outage is announced, whatever an earlier one left recorded.
+                await notificationQueue.delivered(this.id);
+            }
+        }
+    }
+
+    /**
+     * Resend a DOWN notification, through cascade suppression where the monitor opts in.
+     * @param {boolean} isFirstBeat Whether this is the first beat
+     * @param {import("./heartbeat")} bean The DOWN heartbeat
+     * @returns {Promise<void>}
+     */
+    async notifyStillDown(isFirstBeat, bean) {
+        if (this.suppressOnParentDown && this.parent) {
+            await this.sendCascadeDownNotification(isFirstBeat, bean, false);
+        } else {
+            await Monitor.sendNotification(isFirstBeat, this, bean);
+            await notificationQueue.delivered(this.id);
+        }
+    }
+
+    /**
+     * Send a cascade-suppressed monitor's DOWN notification through the parent check.
+     * @param {boolean} isFirstBeat Whether this is the first beat
+     * @param {import("./heartbeat")} bean The DOWN heartbeat
+     * @param {boolean} announcesOutage True for the outage's first DOWN, false for a resend
+     * @returns {Promise<void>}
+     */
+    async sendCascadeDownNotification(isFirstBeat, bean, announcesOutage) {
+        const parentInterval = await this.getParentInterval();
+        if (parentInterval === null) {
+            log.warn("monitor", `[${this.name}] Parent monitor ${this.parent} is absent; sending without suppression`);
+            await Monitor.sendNotification(isFirstBeat, this, bean);
+            await notificationQueue.delivered(this.id);
+            return;
+        }
+        log.debug("monitor", `[${this.name}] Queuing notification (cascade suppression enabled)`);
+        await notificationQueue.enqueue(this, bean, isFirstBeat, Monitor.sendNotification, parentInterval, announcesOutage);
     }
 
     /**
