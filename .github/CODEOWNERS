@@ -1,21 +1,9 @@
-# CODEOWNERS: a pull request that changes a file listed here needs @chrisbaber's approval
-# before it merges (the organization ruleset requires code-owner review), and its description
-# must explain each such file under "## Protected changes" (the protected-changes check).
-# Everything else merges once the required checks pass.
-#
-# Owned in every CopperAssetManagement repository, where the repository has it:
-# - .github/ and this file
-# - releases/ (release requests)
-# - authentication, session, authorization/RBAC, crypto/signing and other security code
-# - secret and credential handling code and secret contracts
-# - database schema and access control (migrations, row-level security, privilege grants)
-# - deployment and infrastructure config (vercel.json, Dockerfiles, ansible, deploy scripts)
-# - anything that can disable or weaken a check (CI gate scripts, PII and data guards,
-#   git hook setup)
-# Not owned: package manifests, lockfiles, TypeScript, lint and format config, Node and npm
-# config (unless it points to a private registry or holds credentials), ordinary application
-# code and documentation.
-# Every pattern below must match a tracked file, except releases/ and reserved detector policy.
+# CODEOWNERS applies the organization's code ownership policy to this repository:
+# https://github.com/CopperAssetManagement/platform/blob/main/.github/codeowners-policy.md
+# is the one definition of what is owned and why. A pull request that changes a file
+# listed here needs @chrisbaber's approval and a "## Protected changes" explanation;
+# everything else merges once the checks pass.
+# Exceptions to the policy's every-pattern-matches-a-file rule: releases/ and reserved detector policy.
 
 # This fork has no release files or secret contracts of its own: node1 runs the image digest
 # that Platform pins, and Platform's release ships it.
