@@ -496,4 +496,37 @@ describe("Push monitor", () => {
             );
         }, { maxretries: 0 });
     });
+
+    for (const [childPush, expected] of [["down", [DOWN]], ["up", []]]) {
+        test(`a push child ${childPush === "down" ? "still DOWN" : "that recovers"} after its parent's recovery is announced ${childPush === "down" ? "once" : "not at all"}`, async () => {
+            const { notificationQueue } = require("../../server/notification-queue");
+            const originalSend = Monitor.sendNotification;
+            const sent = [];
+            Monitor.sendNotification = async (_isFirstBeat, _monitor, bean) => {
+                sent.push(bean.status);
+            };
+            try {
+                await withPushMonitor(`fresh-parent-${childPush}`, async (parentID) => {
+                    await withPushMonitor(
+                        `fresh-child-${childPush}`,
+                        async (childID) => {
+                            await seedHeartbeat(parentID, DOWN, 0, { secondsAgo: 60 });
+                            await seedHeartbeat(childID, DOWN, 0, { secondsAgo: 60 });
+                            await R.exec("UPDATE monitor SET cascade_down_withheld = 'suppressed' WHERE id = ?", [childID]);
+                            await push(`fresh-parent-${childPush}`, "up");
+                            await waitFor(() => notificationQueue.pending.has(childID), 5000, "the child's re-check");
+                            sent.length = 0; // the parent's own Up
+                            await push(`fresh-child-${childPush}`, childPush);
+                            await waitFor(async () => !notificationQueue.pending.has(childID) && !notificationQueue.inflight.has(childID), 5000, "the fresh beat's resolution");
+                            assert.deepStrictEqual(sent, expected);
+                            assert.strictEqual(await R.getCell("SELECT cascade_down_withheld FROM monitor WHERE id = ?", [childID]), null);
+                        },
+                        { parent: parentID, suppressOnParentDown: true, maxretries: 0, interval: 300 }
+                    );
+                }, { maxretries: 0 });
+            } finally {
+                Monitor.sendNotification = originalSend;
+            }
+        });
+    }
 });

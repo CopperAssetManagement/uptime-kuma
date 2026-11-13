@@ -9,6 +9,7 @@ const {
 const { R } = require("redbean-node");
 const apicache = require("../utils/response-cache");
 const Monitor = require("../model/monitor");
+const { notificationQueue } = require("../notification-queue");
 const dayjs = require("dayjs");
 const { UP, MAINTENANCE, DOWN, PENDING, flipStatus, log, badgeConstants } = require("../../src/util");
 const StatusPage = require("../model/status_page");
@@ -123,7 +124,7 @@ router.all("/api/push/:pushToken", async (request, response) => {
 
         await R.store(bean);
         // Not awaited: the push is answered once its beat is stored; this logs its own errors.
-        void monitor.recheckSuppressedChildren(bean);
+        void notificationQueue.freshBeat(monitor.id, bean).then(() => monitor.recheckSuppressedChildren(bean));
 
         io.to(monitor.user_id).emit("heartbeat", bean.toJSON());
 

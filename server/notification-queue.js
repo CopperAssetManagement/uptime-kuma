@@ -9,6 +9,9 @@ const { log, DOWN } = require("../src/util");
 const QUEUED = "queued";
 const SUPPRESSED = "suppressed";
 
+/** How long past its own interval a re-checked child may take to report a fresh beat. */
+const FRESH_BEAT_MARGIN_MS = 60000;
+
 /** How long shutdown waits for deliveries under way. */
 const STOP_WAIT_MS = 10000;
 
@@ -117,7 +120,21 @@ class NotificationQueue {
      * @param {{monitor: object, bean: object, isFirstBeat: boolean, sendFn: Function, announcesOutage: boolean}} entry Held notification
      * @returns {Promise<void>}
      */
-    async resolve({ monitor, bean, isFirstBeat, sendFn, announcesOutage }) {
+    async resolve({ monitor, bean, isFirstBeat, sendFn, announcesOutage, since }) {
+        if (since !== undefined) {
+            // A re-check after the parent's recovery decides on a fresh beat only.
+            const fresh = await R.findOne("heartbeat", " monitor_id = ? AND time > ? ORDER BY time DESC ", [monitor.id, since]);
+            if (!fresh) {
+                log.info("notification-queue", `[${monitor.name}] No fresh beat since its parent recovered; its DOWN stays suppressed`);
+                await setWithheld(monitor.id, SUPPRESSED);
+                return;
+            }
+            if (fresh.status !== DOWN) {
+                await setWithheld(monitor.id, null);
+                return;
+            }
+            bean = fresh;
+        }
         // A DOWN is sent only for a monitor that is still DOWN: one that
         // recovered meanwhile had its recovery withheld, so it sends nothing.
         let latestStatus = null;
@@ -216,9 +233,10 @@ class NotificationQueue {
      * @param {object} parent The parent monitor that came UP
      * @param {Function} sendFn The send function
      * @param {Function} monitorById Returns a child monitor instance by id
+     * @param {string} since The parent's stored UP heartbeat time (UTC)
      * @returns {Promise<void>}
      */
-    async reannounceChildren(parent, sendFn, monitorById) {
+    async reannounceChildren(parent, sendFn, monitorById, since) {
         const children = await R.getCol(
             // Any recorded state: the atomic claim in reannounce() decides, so a
             // child whose state settles to SUPPRESSED meanwhile is not missed.
@@ -227,7 +245,7 @@ class NotificationQueue {
         );
         for (const id of children) {
             try {
-                await this.reannounce(id, parent, sendFn, monitorById);
+                await this.reannounce(id, parent, sendFn, monitorById, since);
             } catch (e) {
                 log.error("notification-queue", `[#${id}] Could not re-check its suppressed DOWN: ${e.message}`);
             }
@@ -241,9 +259,10 @@ class NotificationQueue {
      * @param {object} parent The parent monitor that came UP
      * @param {Function} sendFn The send function
      * @param {Function} monitorById Returns a child monitor instance by id
+     * @param {string} since The parent's stored UP heartbeat time (UTC)
      * @returns {Promise<void>}
      */
-    async reannounce(id, parent, sendFn, monitorById) {
+    async reannounce(id, parent, sendFn, monitorById, since) {
         const resolution = this.inflight.get(id);
         if (resolution) {
             await resolution.catch(() => {});
@@ -264,8 +283,12 @@ class NotificationQueue {
         if (!Number.isFinite(parent.interval) || parent.interval <= 0) {
             throw new TypeError(`Invalid parent interval for monitor ${id}: ${parent.interval}`);
         }
-        const delayMs = Math.max(10000, parent.interval * 1000 + 5000);
-        const entry = { monitor: child, bean: latest, isFirstBeat: false, sendFn, announcesOutage: true };
+        // The child's DOWN is stale (from the outage): announce it only on a
+        // heartbeat newer than the parent's recovery (freshBeat), and wait for
+        // one at most the child's own check interval plus a margin.
+        const childIntervalS = Math.max(Number(child.interval) || 0, Number(child.retryInterval) || 0);
+        const delayMs = Math.max(10000, parent.interval * 1000 + 5000, childIntervalS * 1000 + FRESH_BEAT_MARGIN_MS);
+        const entry = { monitor: child, bean: latest, isFirstBeat: false, sendFn, announcesOutage: true, since };
         entry.timer = this.timers.setTimeout(() => this.fire(entry), delayMs);
         if (entry.timer.unref) {
             entry.timer.unref();
@@ -281,7 +304,24 @@ class NotificationQueue {
             }
             return;
         }
-        log.info("notification-queue", `[${child.name}] Parent [${parent.name}] is UP; re-checking its suppressed DOWN in ${delayMs}ms`);
+        log.info("notification-queue", `[${child.name}] Parent [${parent.name}] is UP; waiting up to ${delayMs}ms for a fresh beat to re-check its suppressed DOWN`);
+    }
+
+    /**
+     * A monitor stored a heartbeat. A child re-checked after its parent's
+     * recovery that is still DOWN on this fresh beat is resolved now (parent
+     * check, then sent once) instead of at the end of its wait.
+     * @param {number} monitorId Monitor identifier
+     * @param {object} bean The stored heartbeat
+     * @returns {Promise<void>}
+     */
+    async freshBeat(monitorId, bean) {
+        const entry = this.pending.get(monitorId);
+        if (!entry || entry.since === undefined || bean.status !== DOWN || !(String(bean.time) > String(entry.since))) {
+            return;
+        }
+        this.timers.clearTimeout(entry.timer);
+        await this.fire(entry);
     }
 
     /**
