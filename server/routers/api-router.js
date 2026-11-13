@@ -122,6 +122,7 @@ router.all("/api/push/:pushToken", async (request, response) => {
         }
 
         await R.store(bean);
+        await monitor.recheckSuppressedChildren(bean);
 
         io.to(monitor.user_id).emit("heartbeat", bean.toJSON());
 

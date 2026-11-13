@@ -470,14 +470,24 @@ describe("Push monitor", () => {
                     await seedHeartbeat(parentID, DOWN, 0);
                     await seedHeartbeat(childID, DOWN, 0);
                     await R.exec("UPDATE monitor SET cascade_down_withheld = 'suppressed' WHERE id = ?", [childID]);
+                    const originalLookup = Monitor.runningOrStored;
+                    const parentStatusAtRecheck = [];
+                    Monitor.runningOrStored = async (id) => {
+                        parentStatusAtRecheck.push(
+                            await R.getCell("SELECT status FROM heartbeat WHERE monitor_id = ? ORDER BY time DESC", [parentID])
+                        );
+                        return originalLookup(id);
+                    };
                     try {
                         await push("reannounce-parent", "up");
+                        assert.deepStrictEqual(parentStatusAtRecheck, [UP], "children are re-checked after the parent's UP is stored");
                         assert.strictEqual(
                             await R.getCell("SELECT cascade_down_withheld FROM monitor WHERE id = ?", [childID]),
                             "queued"
                         );
                         assert.ok(notificationQueue.pending.has(childID), "held again for the parent check");
                     } finally {
+                        Monitor.runningOrStored = originalLookup;
                         notificationQueue.clearTimer(childID);
                     }
                 },

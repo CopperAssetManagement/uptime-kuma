@@ -311,6 +311,33 @@ describe("NotificationQueue", () => {
         assert.equal(queue.size, 1, "already held: not queued twice");
     });
 
+    test("a child that recovers while the re-check runs is not re-queued", async () => {
+        await beat(CHILD, DOWN);
+        await beat(PARENT, UP);
+        await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [SUPPRESSED, CHILD]);
+        const { queue, timers } = manual();
+        // The child's own UP beat settles it after the re-check selected it.
+        await queue.reannounceChildren({ id: PARENT, name: "parent", interval: 60 }, counter(), async (id) => {
+            await queue.recover(id);
+            return { ...child(), id };
+        });
+        assert.equal(queue.size, 0);
+        assert.equal(timers[0].cleared, true, "its timer is cleared");
+        assert.equal(await withheld(), null);
+    });
+
+    test("a held DOWN whose monitor recovered before the parent check sends nothing", async () => {
+        await beat(CHILD, DOWN, "2026-11-12 12:00:00.000");
+        await beat(PARENT, UP);
+        const { queue, timers } = manual();
+        const send = counter();
+        await queue.enqueue(child(), { status: DOWN }, false, send, 60);
+        await beat(CHILD, UP, "2026-11-12 12:00:30.000");
+        await timers[0].fire();
+        assert.equal(send.calls, 0);
+        assert.equal(await withheld(), null);
+    });
+
     test("fails open exactly once when parent status cannot be read", async (t) => {
         const original = R.getRow;
         t.after(() => {

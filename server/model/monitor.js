@@ -1077,6 +1077,7 @@ class Monitor extends BeanModel {
             // Store to database
             log.debug("monitor", `[${this.name}] Store`);
             await R.store(bean);
+            await this.recheckSuppressedChildren(bean);
 
             log.debug("monitor", `[${this.name}] prometheus.update`);
             const data24h = uptimeCalculator.get24Hour();
@@ -1225,24 +1226,32 @@ class Monitor extends BeanModel {
 
     /**
      * On an important beat that leaves DOWN, settle any held cascade notification.
-     * When this monitor comes UP, children whose DOWN was suppressed while it
-     * was DOWN, and which are still DOWN, get that DOWN re-queued through the
-     * parent check, so an outage that outlasts its parent's is still announced.
      * Both the monitor's own checks and the push route call this.
      * @param {import("./heartbeat")} bean The important heartbeat
      * @returns {Promise<boolean>} True when the outage's DOWN was never delivered
      */
     async settleHeldDown(bean) {
-        if (bean.status === UP) {
-            try {
-                await notificationQueue.reannounceChildren(this, Monitor.sendNotification, (id) =>
-                    Monitor.runningOrStored(id)
-                );
-            } catch (e) {
-                log.error("monitor", `[${this.name}] Could not re-check its children's suppressed DOWNs: ${e.message}`);
-            }
-        }
         return bean.status !== DOWN && (await notificationQueue.recover(this.id));
+    }
+
+    /**
+     * After an important UP beat is stored: children whose DOWN was suppressed
+     * while this monitor was DOWN, and which are still DOWN, get that DOWN held
+     * again through the parent check (now reading this UP), so an outage that
+     * outlasts its parent's is still announced. Both the monitor's own checks
+     * and the push route call this, after storing the beat.
+     * @param {import("./heartbeat")} bean The stored heartbeat
+     * @returns {Promise<void>}
+     */
+    async recheckSuppressedChildren(bean) {
+        if (!bean.important || bean.status !== UP) {
+            return;
+        }
+        try {
+            await notificationQueue.reannounceChildren(this, Monitor.sendNotification, (id) => Monitor.runningOrStored(id));
+        } catch (e) {
+            log.error("monitor", `[${this.name}] Could not re-check its children's suppressed DOWNs: ${e.message}`);
+        }
     }
 
     /**
