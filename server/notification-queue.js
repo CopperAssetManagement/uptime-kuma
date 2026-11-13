@@ -118,6 +118,25 @@ class NotificationQueue {
      * @returns {Promise<void>}
      */
     async resolve({ monitor, bean, isFirstBeat, sendFn, announcesOutage }) {
+        // A DOWN is sent only for a monitor that is still DOWN: one that
+        // recovered meanwhile had its recovery withheld, so it sends nothing.
+        let latestStatus = null;
+        try {
+            // getCell adds its own LIMIT 1.
+            latestStatus = await R.getCell(
+                "SELECT status FROM heartbeat WHERE monitor_id = ? ORDER BY time DESC",
+                [monitor.id]
+            );
+        } catch (e) {
+            log.error("notification-queue", `[${monitor.name}] Own status could not be read; treating it as DOWN: ${e.message}`);
+        }
+        if (latestStatus !== null && latestStatus !== undefined && latestStatus !== DOWN) {
+            log.info("notification-queue", `[${monitor.name}] Recovered before its parent check; nothing to send`);
+            if (announcesOutage) {
+                await setWithheld(monitor.id, null);
+            }
+            return;
+        }
         let parentHeartbeat;
         try {
             parentHeartbeat = await R.getRow(
@@ -188,6 +207,81 @@ class NotificationQueue {
      */
     async delivered(monitorId) {
         await setWithheld(monitorId, null);
+    }
+
+    /**
+     * The parent came UP: re-queue each opted-in child whose DOWN was
+     * suppressed and which is still DOWN, through the parent check, so it is
+     * sent once (or suppressed again if the parent is DOWN by then).
+     * @param {object} parent The parent monitor that came UP
+     * @param {Function} sendFn The send function
+     * @param {Function} monitorById Returns a child monitor instance by id
+     * @returns {Promise<void>}
+     */
+    async reannounceChildren(parent, sendFn, monitorById) {
+        const children = await R.getCol(
+            // Any recorded state: the atomic claim in reannounce() decides, so a
+            // child whose state settles to SUPPRESSED meanwhile is not missed.
+            "SELECT id FROM monitor WHERE parent = ? AND active = 1 AND suppress_on_parent_down = 1 AND cascade_down_withheld IS NOT NULL",
+            [parent.id]
+        );
+        for (const id of children) {
+            try {
+                await this.reannounce(id, parent, sendFn, monitorById);
+            } catch (e) {
+                log.error("notification-queue", `[#${id}] Could not re-check its suppressed DOWN: ${e.message}`);
+            }
+        }
+    }
+
+    /**
+     * Hold one child's suppressed DOWN again, claiming it atomically, so a
+     * recovery that settles the child meanwhile wins.
+     * @param {number} id Child monitor identifier
+     * @param {object} parent The parent monitor that came UP
+     * @param {Function} sendFn The send function
+     * @param {Function} monitorById Returns a child monitor instance by id
+     * @returns {Promise<void>}
+     */
+    async reannounce(id, parent, sendFn, monitorById) {
+        const resolution = this.inflight.get(id);
+        if (resolution) {
+            await resolution.catch(() => {});
+        }
+        if (this.pending.has(id)) {
+            // Its parent check runs after this UP was stored, so it sends.
+            return;
+        }
+        const latest = await R.findOne("heartbeat", " monitor_id = ? ORDER BY time DESC ", [id]);
+        if (!latest || latest.status !== DOWN) {
+            // Not DOWN any more: its own recovery settles it, unannounced.
+            return;
+        }
+        const child = await monitorById(id);
+        if (!child) {
+            return;
+        }
+        if (!Number.isFinite(parent.interval) || parent.interval <= 0) {
+            throw new TypeError(`Invalid parent interval for monitor ${id}: ${parent.interval}`);
+        }
+        const delayMs = Math.max(10000, parent.interval * 1000 + 5000);
+        const entry = { monitor: child, bean: latest, isFirstBeat: false, sendFn, announcesOutage: true };
+        entry.timer = this.timers.setTimeout(() => this.fire(entry), delayMs);
+        if (entry.timer.unref) {
+            entry.timer.unref();
+        }
+        this.pending.set(id, entry);
+        const claimed = await R.knex("monitor")
+            .where({ id, cascade_down_withheld: SUPPRESSED })
+            .update({ cascade_down_withheld: QUEUED });
+        if (!claimed) {
+            // Settled meanwhile (its recovery, or another re-check): nothing to send.
+            if (this.pending.get(id) === entry) {
+                this.clearTimer(id);
+            }
+            return;
+        }
+        log.info("notification-queue", `[${child.name}] Parent [${parent.name}] is UP; re-checking its suppressed DOWN in ${delayMs}ms`);
     }
 
     /**
