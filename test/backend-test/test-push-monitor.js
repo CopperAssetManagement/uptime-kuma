@@ -370,7 +370,7 @@ describe("Push monitor", () => {
                 const monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
                 const started = Date.now();
                 try {
-                    await monitor.start(io);
+                    await monitor.start(io, { downtimeMs: 0 });
                     const rows = await waitFor(async () => (await heartbeats(monitorID)).length && heartbeats(monitorID), 5000, "the first check");
                     assert.deepStrictEqual(rows.map((row) => row.status), [DOWN]);
                     assert.ok(Date.now() - started < 5000, "the first check did not wait a full interval");
@@ -386,13 +386,35 @@ describe("Push monitor", () => {
         );
     });
 
-    test("schedules a push monitor's first check one interval after its last beat", () => {
-        const now = dayjs.utc("2026-11-12 12:00:00");
-        const delay = (reference) => Monitor.firstPushCheckDelay(60, reference, now);
-        assert.strictEqual(delay("2026-11-12 11:59:30.000"), 31000, "the remainder of the interval plus the buffer");
-        assert.strictEqual(delay("2026-11-12 11:58:00.000"), 1000, "an overdue push is checked at once");
-        assert.strictEqual(delay("2026-11-12 12:05:00.000"), 60000, "never more than one interval");
-        assert.strictEqual(delay(null), 60000, "an unknown reference waits one interval");
+    test("resuming a paused push monitor keeps a full interval of grace", async () => {
+        await withPushMonitor(
+            "resumed",
+            async (monitorID) => {
+                const monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
+                try {
+                    await monitor.start(io);
+                    await sleep(3000);
+                    assert.deepStrictEqual(await heartbeats(monitorID), []);
+                } finally {
+                    await monitor.stop();
+                }
+            },
+            {
+                interval: 3600,
+                maxretries: 0,
+                created_date: R.isoDateTime(dayjs.utc().subtract(2, "hour")),
+            }
+        );
+    });
+
+    test("schedules a push monitor's first check at server start from its last beat and Kuma's downtime", () => {
+        const second = 1000;
+        const delay = (elapsed, downtime = 0) => Monitor.firstPushCheckDelay(60, elapsed, downtime);
+        assert.strictEqual(delay(30 * second), 31 * second, "the remainder of the interval plus the buffer");
+        assert.strictEqual(delay(120 * second), second, "an overdue push is checked at once");
+        assert.strictEqual(delay(120 * second, 100 * second), 41 * second, "time Kuma was down is credited");
+        assert.strictEqual(delay(-300 * second), 60 * second, "never more than one interval");
+        assert.strictEqual(delay(null), 60 * second, "an unknown reference waits one interval");
     });
 
     test("a pushed recovery whose DOWN was never delivered is not announced", async () => {
@@ -422,6 +444,11 @@ describe("Push monitor", () => {
                     await R.exec("UPDATE monitor SET cascade_down_withheld = NULL WHERE id = ?", [monitorID]);
                     await push("cascade-orphan-up", "up");
                     assert.deepStrictEqual(sent, [UP]);
+                    // A DOWN sent directly (suppression turned off) clears what an earlier outage left.
+                    await R.exec("UPDATE monitor SET suppress_on_parent_down = 0, cascade_down_withheld = 'suppressed' WHERE id = ?", [monitorID]);
+                    await push("cascade-orphan-up", "down");
+                    await push("cascade-orphan-up", "up");
+                    assert.deepStrictEqual(sent, [UP, DOWN, UP]);
                 },
                 { parent: parent.id, suppressOnParentDown: true, maxretries: 0 }
             );

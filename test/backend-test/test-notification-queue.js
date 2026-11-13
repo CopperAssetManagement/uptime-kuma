@@ -204,13 +204,64 @@ describe("NotificationQueue", () => {
         assert.equal(await withheld(), null);
     });
 
-    test("start resumes nothing unless a DOWN was held", async () => {
+    test("start resumes nothing unless a DOWN was held, and clears a hold whose DOWN was never stored", async () => {
         const { queue } = manual();
         await beat(CHILD, DOWN);
         await queue.resume(child(), counter(), 60);
         await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [SUPPRESSED, CHILD]);
         await queue.resume(child(), counter(), 60);
         assert.equal(queue.size, 0);
+        assert.equal(await withheld(), SUPPRESSED, "a suppressed outage is settled by its recovery, not by a start");
+
+        await beat(CHILD, UP, "2026-11-12 12:01:00.000");
+        await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [QUEUED, CHILD]);
+        await queue.resume(child(), counter(), 60);
+        assert.equal(queue.size, 0);
+        assert.equal(await withheld(), null);
+    });
+
+    test("a recovery during the parent check and delivery waits for its outcome", async () => {
+        await beat(PARENT, UP);
+        const { queue, timers } = manual();
+        let release;
+        const gate = new Promise((resolve) => (release = resolve));
+        const sent = [];
+        await queue.enqueue(child(), { status: DOWN }, false, async (_first, _monitor, bean) => {
+            await gate;
+            sent.push(bean.status);
+        }, 60);
+        const firing = timers[0].fire();
+        const recovery = queue.recover(CHILD);
+        release();
+        await firing;
+        assert.equal(await recovery, false, "the DOWN was delivered, so the recovery is announced");
+        assert.deepEqual(sent, [DOWN]);
+    });
+
+    test("a recovery during a suppressing parent check leaves nothing recorded", async () => {
+        await beat(PARENT, DOWN);
+        const { queue, timers } = manual();
+        await queue.enqueue(child(), { status: DOWN }, false, counter(), 60);
+        const firing = timers[0].fire();
+        const recovery = queue.recover(CHILD);
+        await firing;
+        assert.equal(await recovery, true);
+        assert.equal(await withheld(), null);
+    });
+
+    test("after stop nothing is scheduled, and a held DOWN is recorded for the next start", async () => {
+        const { queue, timers } = manual();
+        queue.stop();
+        await queue.enqueue(child(), { status: DOWN }, false, counter(), 60);
+        assert.equal(timers.length, 0);
+        assert.equal(queue.size, 0);
+        assert.equal(await withheld(), QUEUED);
+    });
+
+    test("a DOWN delivered without the queue clears an earlier outage's record", async () => {
+        await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [SUPPRESSED, CHILD]);
+        await new NotificationQueue().delivered(CHILD);
+        assert.equal(await withheld(), null);
     });
 
     test("fails open exactly once when parent status cannot be read", async (t) => {

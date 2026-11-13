@@ -31,6 +31,10 @@ class NotificationQueue {
      */
     constructor(timers = globalThis) {
         this.timers = timers;
+        /** @type {Map<number, Promise<void>>} Resolutions under way (parent check and delivery) */
+        this.inflight = new Map();
+        /** Set on shutdown: nothing is scheduled or sent any more */
+        this.stopped = false;
         /** @type {Map<number, {timer: NodeJS.Timeout, monitor: object, bean: object, isFirstBeat: boolean, sendFn: Function, announcesOutage: boolean}>} */
         this.pending = new Map();
     }
@@ -57,31 +61,52 @@ class NotificationQueue {
         announcesOutage = announcesOutage || Boolean(replaced?.announcesOutage);
         this.clearTimer(monitor.id);
 
+        if (!this.stopped) {
+            // Calculate delay: parent's interval + 5s buffer, minimum 10s
+            const delayMs = Math.max(10000, parentInterval * 1000 + 5000);
+            log.info("notification-queue", `[${monitor.name}] Queuing notification for ${delayMs}ms (parent interval: ${parentInterval}s)`);
+
+            // Registered before any await, so a recovery arriving meanwhile cancels it.
+            const entry = { monitor, bean, isFirstBeat, sendFn, announcesOutage };
+            entry.timer = this.timers.setTimeout(() => this.fire(entry), delayMs);
+            // Don't let the timer prevent Node.js from exiting
+            if (entry.timer.unref) {
+                entry.timer.unref();
+            }
+            this.pending.set(monitor.id, entry);
+        } else {
+            // Shutting down: send nothing now; recorded as queued, it resumes on start.
+            log.info("notification-queue", `[${monitor.name}] Holding a DOWN notification until the next start`);
+        }
+
         if (announcesOutage) {
             await setWithheld(monitor.id, QUEUED);
         }
+    }
 
-        // Calculate delay: parent's interval + 5s buffer, minimum 10s
-        const delayMs = Math.max(10000, parentInterval * 1000 + 5000);
-
-        log.info("notification-queue", `[${monitor.name}] Queuing notification for ${delayMs}ms (parent interval: ${parentInterval}s)`);
-
-        const entry = { monitor, bean, isFirstBeat, sendFn, announcesOutage };
-        entry.timer = this.timers.setTimeout(async () => {
-            this.pending.delete(monitor.id);
-            try {
-                await this.resolve(entry);
-            } catch (e) {
-                log.error("notification-queue", `[${monitor.name}] Delayed notification failed: ${e.message}`);
-            }
-        }, delayMs);
-
-        // Don't let the timer prevent Node.js from exiting
-        if (entry.timer.unref) {
-            entry.timer.unref();
+    /**
+     * A held notification's delay elapsed: resolve it, and let a recovery that
+     * arrives meanwhile wait for the outcome (recover()).
+     * @param {{monitor: object, bean: object, isFirstBeat: boolean, sendFn: Function, announcesOutage: boolean}} entry Held notification
+     * @returns {Promise<void>}
+     */
+    async fire(entry) {
+        const id = entry.monitor.id;
+        if (this.pending.get(id) !== entry) {
+            return;
         }
-
-        this.pending.set(monitor.id, entry);
+        this.pending.delete(id);
+        const resolution = this.resolve(entry);
+        this.inflight.set(id, resolution);
+        try {
+            await resolution;
+        } catch (e) {
+            log.error("notification-queue", `[${entry.monitor.name}] Delayed notification failed: ${e.message}`);
+        } finally {
+            if (this.inflight.get(id) === resolution) {
+                this.inflight.delete(id);
+            }
+        }
     }
 
     /**
@@ -131,6 +156,8 @@ class NotificationQueue {
 
     /**
      * The child left DOWN: cancel any held notification and settle the outage.
+     * A resolution already under way is awaited first, so its outcome (sent or
+     * suppressed) decides whether the recovery is announced.
      * @param {number} monitorId Child monitor identifier
      * @returns {Promise<boolean>} True when the outage's DOWN was never delivered,
      * so its recovery must not be announced either
@@ -139,11 +166,25 @@ class NotificationQueue {
         if (this.clearTimer(monitorId)) {
             log.info("notification-queue", `[#${monitorId}] Cancelled delayed notification`);
         }
+        const resolution = this.inflight.get(monitorId);
+        if (resolution) {
+            await resolution.catch(() => {});
+        }
         const withheld = await R.getCell("SELECT cascade_down_withheld FROM monitor WHERE id = ?", [monitorId]);
         if (withheld) {
             await setWithheld(monitorId, null);
         }
         return Boolean(withheld);
+    }
+
+    /**
+     * A DOWN was delivered without the queue (no cascade suppression, or its
+     * parent is absent): the outage is announced, whatever an earlier one left.
+     * @param {number} monitorId Monitor identifier
+     * @returns {Promise<void>}
+     */
+    async delivered(monitorId) {
+        await setWithheld(monitorId, null);
     }
 
     /**
@@ -156,7 +197,7 @@ class NotificationQueue {
      * @returns {Promise<void>}
      */
     async resume(monitor, sendFn, parentInterval) {
-        if (this.pending.has(monitor.id)) {
+        if (this.pending.has(monitor.id) || this.inflight.has(monitor.id)) {
             return;
         }
         const withheld = await R.getCell("SELECT cascade_down_withheld FROM monitor WHERE id = ?", [monitor.id]);
@@ -165,8 +206,8 @@ class NotificationQueue {
         }
         const latest = await R.findOne("heartbeat", " monitor_id = ? ORDER BY time DESC ", [monitor.id]);
         if (!latest || latest.status !== DOWN) {
-            // It recovered while stopped; its DOWN was never delivered, so stays withheld
-            // until the next beat settles it (recover()).
+            // Stopped before the DOWN was stored, or recovered while stopped: nothing to send.
+            await setWithheld(monitor.id, null);
             return;
         }
         log.info("notification-queue", `[${monitor.name}] Resuming a DOWN notification held before the last stop`);
@@ -174,11 +215,13 @@ class NotificationQueue {
     }
 
     /**
-     * Stop every timer without sending (used on shutdown). Held DOWNs stay
-     * recorded as queued and are resumed with their parent check on start.
+     * Stop every timer without sending (used on shutdown, after the monitors
+     * have stopped). Held DOWNs stay recorded as queued and are resumed with
+     * their parent check on start; nothing is scheduled afterwards.
      * @returns {void}
      */
     stop() {
+        this.stopped = true;
         log.info("notification-queue", `Stopping with ${this.pending.size} held notification(s); they resume on start`);
         for (const entry of this.pending.values()) {
             this.timers.clearTimeout(entry.timer);

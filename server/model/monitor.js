@@ -420,9 +420,10 @@ class Monitor extends BeanModel {
     /**
      * Start monitor
      * @param {Server} io Socket server instance
+     * @param {{downtimeMs?: number}} options At server start: how long Kuma was not running
      * @returns {Promise<void>}
      */
-    async start(io) {
+    async start(io, options = {}) {
         let previousBeat = null;
         let retries = 0;
 
@@ -1116,49 +1117,81 @@ class Monitor extends BeanModel {
         };
 
         // A DOWN still waiting for its parent check at the last stop resumes now.
+        // Cascade bookkeeping must never keep the monitor from running.
         if (this.suppressOnParentDown && this.parent) {
-            const parentInterval = await this.getParentInterval();
-            if (parentInterval !== null) {
-                await notificationQueue.resume(this, Monitor.sendNotification, parentInterval);
+            try {
+                const parentInterval = await this.getParentInterval();
+                if (parentInterval !== null) {
+                    await notificationQueue.resume(this, Monitor.sendNotification, parentInterval);
+                }
+            } catch (e) {
+                log.error("monitor", `[${this.name}] Could not resume a held DOWN notification: ${e.message}`);
             }
         }
 
-        // Delay Push Type: its first check falls one interval after its last
-        // beat (or its creation), not one interval after this start, so a
-        // restart neither postpones a missed push nor hides a never-pushed one.
+        // Delay Push Type. At server start (options.downtimeMs given), the first
+        // check falls one interval after the last beat (or creation, if never
+        // pushed), extended by the time Kuma was not running, so a restart neither
+        // postpones a missed push nor alerts on a push lost while Kuma was down.
+        // Resuming or editing a monitor keeps upstream's full interval of grace.
         if (this.type === "push") {
-            const reference = await R.getCell(
-                "SELECT COALESCE((SELECT MAX(time) FROM heartbeat WHERE monitor_id = ?), created_date) FROM monitor WHERE id = ?",
-                [this.id, this.id]
-            );
-            const delay = Monitor.firstPushCheckDelay(this.interval, reference, dayjs.utc());
+            let delay = this.interval * 1000;
+            if (options.downtimeMs !== undefined) {
+                try {
+                    delay = Monitor.firstPushCheckDelay(this.interval, await this.msSinceLastPushReference(), options.downtimeMs);
+                } catch (e) {
+                    log.error("monitor", `[${this.name}] Could not read its last beat; first check in one interval: ${e.message}`);
+                }
+            }
             log.debug("monitor", `[${this.name}] First push check in ${delay}ms`);
-            this.heartbeatInterval = setTimeout(() => {
-                safeBeat();
-            }, Math.min(delay, MAX_TIMEOUT_MS));
+            if (!this.isStop) {
+                this.heartbeatInterval = setTimeout(() => {
+                    safeBeat();
+                }, Math.min(delay, MAX_TIMEOUT_MS));
+            }
         } else {
             safeBeat();
         }
     }
 
     /**
-     * Delay before a push monitor's first check after it starts.
-     * @param {number} intervalSeconds Monitor interval in seconds
-     * @param {(string|null)} reference UTC time of its last heartbeat, else its creation
-     * @param {dayjs.Dayjs} now Current UTC time
-     * @returns {number} Milliseconds: one interval after the reference plus the
-     * push check's 1s buffer, at least the buffer, and a full interval when the
-     * reference is unknown
+     * Time since a push monitor's last heartbeat, or since its creation when it
+     * has none.
+     * @returns {Promise<(number|null)>} Milliseconds, or null when unknown
      */
-    static firstPushCheckDelay(intervalSeconds, reference, now) {
+    async msSinceLastPushReference() {
+        const row = await R.getRow(
+            "SELECT (SELECT MAX(time) FROM heartbeat WHERE monitor_id = ?) AS last_beat, created_date, CURRENT_TIMESTAMP AS db_now FROM monitor WHERE id = ?",
+            [this.id, this.id]
+        );
+        if (row?.last_beat) {
+            // Heartbeat times are written in UTC.
+            return dayjs.utc().valueOf() - dayjs.utc(row.last_beat).valueOf();
+        }
+        if (row?.created_date && row?.db_now) {
+            // created_date is the database's own clock and zone; compare it with the same.
+            return dayjs(row.db_now).valueOf() - dayjs(row.created_date).valueOf();
+        }
+        return null;
+    }
+
+    /**
+     * Delay before a push monitor's first check when Kuma starts.
+     * @param {number} intervalSeconds Monitor interval in seconds
+     * @param {(number|null)} elapsedMs Time since its last beat, or creation
+     * @param {number} downtimeMs How long Kuma was not running before this start
+     * @returns {number} Milliseconds: what remains of one interval after the
+     * reference, extended by the downtime, plus the push check's 1s buffer; at
+     * least the buffer and at most one interval; one interval when unknown
+     */
+    static firstPushCheckDelay(intervalSeconds, elapsedMs, downtimeMs) {
         const bufferTime = 1000;
         const intervalMs = intervalSeconds * 1000;
-        const referenceTime = reference ? dayjs.utc(reference) : null;
-        if (!referenceTime || !referenceTime.isValid()) {
+        if (!Number.isFinite(elapsedMs)) {
             return intervalMs;
         }
-        const elapsed = now.valueOf() - referenceTime.valueOf();
-        return Math.min(intervalMs, Math.max(bufferTime, intervalMs - elapsed + bufferTime));
+        const credit = Number.isFinite(downtimeMs) && downtimeMs > 0 ? downtimeMs : 0;
+        return Math.min(intervalMs, Math.max(bufferTime, intervalMs - elapsedMs + credit + bufferTime));
     }
 
     /**
@@ -1197,6 +1230,10 @@ class Monitor extends BeanModel {
         } else {
             log.debug("monitor", `[${this.name}] sendNotification`);
             await Monitor.sendNotification(isFirstBeat, this, bean);
+            if (bean.status === DOWN) {
+                // This outage is announced, whatever an earlier one left recorded.
+                await notificationQueue.delivered(this.id);
+            }
         }
     }
 
@@ -1226,6 +1263,7 @@ class Monitor extends BeanModel {
         if (parentInterval === null) {
             log.warn("monitor", `[${this.name}] Parent monitor ${this.parent} is absent; sending without suppression`);
             await Monitor.sendNotification(isFirstBeat, this, bean);
+            await notificationQueue.delivered(this.id);
             return;
         }
         log.debug("monitor", `[${this.name}] Queuing notification (cascade suppression enabled)`);
