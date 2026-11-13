@@ -430,6 +430,14 @@ describe("NotificationQueue", () => {
         assert.equal(await withheld(), null);
     });
 
+    test("a resend tick during a re-check sends nothing and leaves it rechecking", async () => {
+        const { queue, send } = await recheck(pushChild);
+        await queue.enqueue({ ...child(), type: "push", interval: 180 }, { status: DOWN }, false, send, 60, false);
+        assert.equal(queue.isRechecking(CHILD), true);
+        assert.equal(await withheld(), RECHECKING);
+        assert.equal(send.calls, 0);
+    });
+
     test("a beat older than the parent's recovery does not resolve a re-check", async () => {
         await beat(CHILD, DOWN);
         const { queue } = manual();

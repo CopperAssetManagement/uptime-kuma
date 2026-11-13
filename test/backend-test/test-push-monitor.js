@@ -529,4 +529,87 @@ describe("Push monitor", () => {
             }
         });
     }
+
+    test("a push child's own no-heartbeat tick during its re-check, then an UP push, sends nothing", async () => {
+        const { notificationQueue } = require("../../server/notification-queue");
+        const originalSend = Monitor.sendNotification;
+        const sent = [];
+        Monitor.sendNotification = async (_isFirstBeat, _monitor, bean) => {
+            sent.push(bean.status);
+        };
+        try {
+            await withPushMonitor("tick-parent", async (parentID) => {
+                await withPushMonitor(
+                    "tick-child",
+                    async (childID) => {
+                        await seedHeartbeat(parentID, DOWN, 0, { secondsAgo: 120 });
+                        await seedHeartbeat(childID, DOWN, 0, { secondsAgo: 120 });
+                        await R.exec("UPDATE monitor SET cascade_down_withheld = 'suppressed' WHERE id = ?", [childID]);
+                        await push("tick-parent", "up");
+                        await waitFor(() => notificationQueue.pending.has(childID), 5000, "the child's re-check");
+                        sent.length = 0; // the parent's own Up
+                        const monitor = await R.findOne("monitor", " id = ? ", [childID]);
+                        try {
+                            // Overdue at start, so Kuma ticks its own "no heartbeat" DOWN at once.
+                            const before = (await heartbeats(childID)).length;
+                            await monitor.start(io, { stoppedAtMs: Date.now() });
+                            await waitFor(async () => (await heartbeats(childID)).length > before, 5000, "Kuma's own tick");
+                            assert.ok(notificationQueue.pending.has(childID), "the tick does not decide a push child");
+                            await push("tick-child", "up");
+                            await waitFor(async () => !notificationQueue.pending.has(childID), 5000, "the UP push");
+                            assert.deepStrictEqual(sent, []);
+                        } finally {
+                            await monitor.stop();
+                        }
+                    },
+                    { parent: parentID, suppressOnParentDown: true, maxretries: 0, interval: 20 }
+                );
+            }, { maxretries: 0 });
+        } finally {
+            Monitor.sendNotification = originalSend;
+        }
+    });
+
+    test("a checked child being re-checked runs its checks at its retry interval and pages only after its retries", async () => {
+        const { notificationQueue } = require("../../server/notification-queue");
+        const net = require("node:net");
+        const closed = net.createServer();
+        await new Promise((resolve) => closed.listen(0, "127.0.0.1", resolve));
+        const port = closed.address().port;
+        await new Promise((resolve) => closed.close(resolve));
+        const originalSend = Monitor.sendNotification;
+        const sent = [];
+        Monitor.sendNotification = async (_isFirstBeat, _monitor, bean) => {
+            sent.push(bean.status);
+        };
+        const child = R.dispense("monitor");
+        try {
+            await withPushMonitor("cadence-parent", async (parentID) => {
+                Object.assign(child, {
+                    name: "cadence-child", type: "port", hostname: "127.0.0.1", port, active: true, user_id: userID,
+                    interval: 300, retryInterval: 20, maxretries: 2, timeout: 2, parent: parentID, suppressOnParentDown: true,
+                });
+                await R.store(child);
+                await seedHeartbeat(parentID, DOWN, 0, { secondsAgo: 120 });
+                await seedHeartbeat(child.id, DOWN, 2, { secondsAgo: 120 });
+                await R.exec("UPDATE monitor SET cascade_down_withheld = 'suppressed' WHERE id = ?", [child.id]);
+                await push("cadence-parent", "up");
+                await waitFor(() => notificationQueue.isRechecking(child.id), 5000, "the child's re-check");
+                sent.length = 0;
+                const monitor = await R.findOne("monitor", " id = ? ", [child.id]);
+                try {
+                    await monitor.start(io);
+                    // Its first fresh check runs at once, the next at its 20 s retry interval, not 300 s.
+                    await waitFor(async () => (await heartbeats(child.id)).length >= 3, 30000, "two fresh checks");
+                    assert.deepStrictEqual(sent, [], "two failed checks are within its two retries");
+                    assert.ok(notificationQueue.isRechecking(child.id));
+                } finally {
+                    await monitor.stop();
+                    notificationQueue.clearTimer(child.id);
+                }
+            }, { maxretries: 0 });
+        } finally {
+            Monitor.sendNotification = originalSend;
+        }
+    });
 });

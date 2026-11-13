@@ -71,6 +71,11 @@ class NotificationQueue {
 
         // A resend that replaces a still-pending first DOWN still announces the outage.
         const replaced = this.pending.get(monitor.id);
+        if (replaced?.since !== undefined && !announcesOutage) {
+            // A re-check after the parent's recovery already decides whether this
+            // outage is announced; a resend tick must not bypass it.
+            return;
+        }
         announcesOutage = announcesOutage || Boolean(replaced?.announcesOutage);
         this.clearTimer(monitor.id);
 
@@ -328,7 +333,9 @@ class NotificationQueue {
         const retries = Math.max(0, Number(child.maxretries) || 0);
         // A push child is decided by its producer within one push window; a
         // checked child gets its first check plus its own retries.
-        const windowS = child.type === "push" ? intervalS : intervalS + retries * retryS;
+        // A check can outlast its retry interval, so each retry may also take its timeout.
+        const timeoutS = Math.max(0, Number(child.timeout) || 0);
+        const windowS = child.type === "push" ? intervalS : intervalS + retries * retryS + (retries + 1) * timeoutS;
         const delayMs = Math.min(
             MAX_TIMEOUT_MS,
             Math.max(10000, parentInterval * 1000 + 5000, windowS * 1000 + FRESH_BEAT_MARGIN_MS)
