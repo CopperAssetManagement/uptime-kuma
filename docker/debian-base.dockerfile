@@ -1,5 +1,9 @@
+# The fork builds its own base on this one Node image (estate Node line 26),
+# pinned by digest.
+ARG NODE_IMAGE=docker.io/library/node:26-bookworm-slim@sha256:5df79989ed685e09f0a98019db4cebfb22fb9df1a53c0161664a011f7ff6b0f1
+
 # Download Apprise deb package
-FROM node:22-bookworm-slim AS download-apprise
+FROM $NODE_IMAGE AS download-apprise
 WORKDIR /app
 COPY ./extra/download-apprise.mjs ./download-apprise.mjs
 RUN apt update && \
@@ -9,7 +13,7 @@ RUN apt update && \
 
 # Base Image (Slim)
 # If the image changed, the second stage image should be changed too
-FROM node:22-bookworm-slim AS base2-slim
+FROM $NODE_IMAGE AS base2-slim
 ARG TARGETPLATFORM
 
 # Specify --no-install-recommends to skip unused dependencies, make the base much smaller!
@@ -66,9 +70,8 @@ RUN curl -fsSL https://letsencrypt.org/certs/gen-y/root-ye.pem -o /usr/local/sha
 
 # Full Base Image
 # MariaDB, Chromium and fonts
-# Make sure to reuse the slim image here. Uncomment the above line if you want to build it from scratch.
-# FROM base2-slim AS base2
-FROM louislam/uptime-kuma:base2-slim AS base2
+# The fork builds the full base from its own slim stage above, not upstream's published one.
+FROM base2-slim AS base2
 ENV UPTIME_KUMA_ENABLE_EMBEDDED_MARIADB=1
 RUN apt update && \
     apt --yes --no-install-recommends install chromium fonts-indic fonts-noto fonts-noto-cjk mariadb-server && \

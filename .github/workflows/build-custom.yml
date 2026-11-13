@@ -4,7 +4,13 @@ on:
   push:
     branches:
       - main
-      - feature/cascade-suppression
+  # Pull requests build and start the image but publish nothing.
+  pull_request:
+    paths:
+      - "docker/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/build-custom.yml"
 
 env:
   REGISTRY: ghcr.io
@@ -30,29 +36,69 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Login to GHCR
+        if: github.event_name == 'push'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Choose the image tags
+        id: tags
+        env:
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          {
+            echo 'set<<EOF'
+            if [[ "${EVENT}" == push ]]; then
+              echo "release.tags=${REGISTRY}/${IMAGE_NAME}:2-cascade"
+              echo "release.tags=${REGISTRY}/${IMAGE_NAME}:2-cascade-${SHA}"
+            else
+              echo "release.tags=${REGISTRY}/${IMAGE_NAME}:pr-check"
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build the base and the release
         id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
         with:
-          context: .
-          file: docker/dockerfile
-          target: release
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:2-cascade
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:2-cascade-${{ github.sha }}
-          platforms: linux/amd64
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          source: .
+          files: docker/docker-bake.hcl
+          targets: release
+          push: ${{ github.event_name == 'push' }}
+          load: ${{ github.event_name != 'push' }}
+          set: |
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+            release.labels.org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            release.labels.org.opencontainers.image.revision=${{ github.sha }}
+            ${{ steps.tags.outputs.set }}
+
+      - name: Start the built image and check its runtime
+        if: github.event_name != 'push'
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}:pr-check"
+          mkdir -p "${RUNNER_TEMP}/kuma-data"
+          echo '{"type":"sqlite"}' > "${RUNNER_TEMP}/kuma-data/db-config.json"
+          docker run --rm --entrypoint node "${image}" -e 'console.log(process.version, require("/app/package.json").version)'
+          docker run -d --name kuma-check -p 127.0.0.1:3001:3001 -v "${RUNNER_TEMP}/kuma-data:/app/data" "${image}"
+          for _ in $(seq 1 90); do
+            if curl -fsS 'http://127.0.0.1:3001/socket.io/?EIO=4&transport=polling' | grep -q '^0'; then
+              echo "Kuma is serving"; docker rm -f kuma-check >/dev/null; exit 0
+            fi
+            sleep 2
+          done
+          docker logs kuma-check | tail -50
+          exit 1
 
       - name: Record immutable image digest
-        run: echo "Built ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+        if: github.event_name == 'push'
+        env:
+          METADATA: ${{ steps.build.outputs.metadata }}
+        run: |
+          digest="$(jq -r '.release["containerimage.digest"]' <<<"${METADATA}")"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "Built ${REGISTRY}/${IMAGE_NAME}@${digest}" >> "$GITHUB_STEP_SUMMARY"

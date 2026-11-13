@@ -1,6 +1,7 @@
-# Base images are pinned by digest so a rebuild of this revision is reproducible
-# (Node 22.23.5, upstream base2 of 2026-11-12). Update the digests deliberately.
-ARG BASE_IMAGE=docker.io/louislam/uptime-kuma:base2@sha256:b7b28cf4eb239b9163501cad27f94dfebe299d27972d7740e542a437ca04c249
+# The base (Node, apprise, cloudflared, Chromium, MariaDB) is built by the fork
+# from docker/debian-base.dockerfile, which pins its Node image by digest; the
+# bake file (docker/docker-bake.hcl) supplies it to this build as "base2".
+ARG BASE_IMAGE=base2
 
 ############################################
 # Build in Golang

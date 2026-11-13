@@ -26,6 +26,9 @@ jobs:
         include:
           - os: ubuntu-22.04
             node: 25
+          # The fork's image runs Node 26 (docker/debian-base.dockerfile).
+          - os: ubuntu-22.04
+            node: 26
 
     steps:
       - run: git config --global core.autocrlf false # Mainly for Windows
