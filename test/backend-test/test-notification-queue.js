@@ -177,7 +177,7 @@ describe("NotificationQueue", () => {
         await beat(CHILD, DOWN);
         const send = counter();
         await before.enqueue(child(), { status: DOWN }, false, send, 60);
-        before.stop();
+        await before.stop();
         assert.equal(before.size, 0);
         assert.equal(send.calls, 0, "shutdown sends no held notification");
         assert.equal(await withheld(), QUEUED);
@@ -251,7 +251,7 @@ describe("NotificationQueue", () => {
 
     test("after stop nothing is scheduled, and a held DOWN is recorded for the next start", async () => {
         const { queue, timers } = manual();
-        queue.stop();
+        await queue.stop();
         await queue.enqueue(child(), { status: DOWN }, false, counter(), 60);
         assert.equal(timers.length, 0);
         assert.equal(queue.size, 0);

@@ -8,6 +8,8 @@ console.log("Welcome to Uptime Kuma");
 // As the log function need to use dayjs, it should be very top
 const dayjs = require("dayjs");
 dayjs.extend(require("dayjs/plugin/utc"));
+// When this process started: monitors measure Kuma's downtime up to it.
+const processStartedAt = dayjs.utc();
 dayjs.extend(require("./modules/dayjs/plugin/timezone"));
 dayjs.extend(require("dayjs/plugin/customParseFormat"));
 
@@ -1958,10 +1960,13 @@ async function pauseMonitor(userID, monitorID) {
 async function startMonitors() {
     let list = await R.find("monitor", " active = 1 ");
 
-    // How long Kuma was not running: since its newest heartbeat. Push monitors
-    // credit it, so a push lost while Kuma was down does not alert.
-    const lastHeartbeat = await R.getCell("SELECT MAX(time) FROM heartbeat");
-    const downtimeMs = lastHeartbeat ? Math.max(0, dayjs.utc().valueOf() - dayjs.utc(lastHeartbeat).valueOf()) : 0;
+    // How long Kuma was not running: from its newest heartbeat before this
+    // process started. A push monitor whose push came due meanwhile is first
+    // checked at the job's next expected push, not at once.
+    const lastHeartbeat = await R.getCell("SELECT MAX(time) FROM heartbeat WHERE time < ?", [
+        R.isoDateTimeMillis(processStartedAt),
+    ]);
+    const downtimeMs = lastHeartbeat ? Math.max(0, processStartedAt.valueOf() - dayjs.utc(lastHeartbeat).valueOf()) : 0;
     log.info("server", `Starting monitors; Kuma was not running for ${Math.round(downtimeMs / 1000)}s`);
 
     for (let monitor of list) {
@@ -1998,7 +2003,7 @@ async function shutdownFunction(signal) {
     }
 
     // Send nothing held for a parent check; it resumes with that check on start.
-    notificationQueue.stop();
+    await notificationQueue.stop();
     await sleep(2000);
     await Database.close();
 

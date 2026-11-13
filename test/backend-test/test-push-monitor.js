@@ -409,11 +409,13 @@ describe("Push monitor", () => {
 
     test("schedules a push monitor's first check at server start from its last beat and Kuma's downtime", () => {
         const second = 1000;
-        const delay = (elapsed, downtime = 0) => Monitor.firstPushCheckDelay(60, elapsed, downtime);
-        assert.strictEqual(delay(30 * second), 31 * second, "the remainder of the interval plus the buffer");
-        assert.strictEqual(delay(120 * second), second, "an overdue push is checked at once");
-        assert.strictEqual(delay(120 * second, 100 * second), 41 * second, "time Kuma was down is credited");
-        assert.strictEqual(delay(-300 * second), 60 * second, "never more than one interval");
+        const delay = (elapsed, downtime = 0) => Monitor.firstPushCheckDelay(60, elapsed === null ? null : elapsed * second, downtime * second);
+        assert.strictEqual(delay(30), 31 * second, "deadline ahead: at the deadline, plus the buffer");
+        assert.strictEqual(delay(120, 10), second, "overdue before Kuma stopped: at once");
+        assert.strictEqual(delay(75, 45), 46 * second, "due while Kuma was down: at the next expected push");
+        assert.strictEqual(delay(120, 100), second, "the next expected push is now");
+        assert.strictEqual(delay(130, 100), 51 * second, "due twice while down: at the next expected push");
+        assert.strictEqual(delay(-300), 61 * second, "a future reference waits one interval");
         assert.strictEqual(delay(null), 60 * second, "an unknown reference waits one interval");
     });
 

@@ -780,7 +780,9 @@ class Monitor extends BeanModel {
                             // No need to insert successful heartbeat for push type, so end here
                             retries = 0;
                             log.debug("monitor", `[${this.name}] timeout = ${timeout}`);
-                            this.heartbeatInterval = setTimeout(safeBeat, Math.min(timeout, MAX_TIMEOUT_MS));
+                            if (!this.isStop) {
+                                this.heartbeatInterval = setTimeout(safeBeat, Math.min(timeout, MAX_TIMEOUT_MS));
+                            }
                             return;
                         }
                     } else {
@@ -1170,28 +1172,43 @@ class Monitor extends BeanModel {
         }
         if (row?.created_date && row?.db_now) {
             // created_date is the database's own clock and zone; compare it with the same.
-            return dayjs(row.db_now).valueOf() - dayjs(row.created_date).valueOf();
+            return dayjs.utc(row.db_now).valueOf() - dayjs.utc(row.created_date).valueOf();
         }
         return null;
     }
 
     /**
      * Delay before a push monitor's first check when Kuma starts.
+     *
+     * With the deadline one interval after the reference (last beat, or
+     * creation) and Kuma stopped downtimeMs before this start:
+     * - deadline still ahead: check at the deadline;
+     * - deadline passed while Kuma was down (a push may have been lost): check
+     *   at the next push the job is expected to make;
+     * - deadline passed before Kuma stopped (already overdue): check at once.
      * @param {number} intervalSeconds Monitor interval in seconds
      * @param {(number|null)} elapsedMs Time since its last beat, or creation
      * @param {number} downtimeMs How long Kuma was not running before this start
-     * @returns {number} Milliseconds: what remains of one interval after the
-     * reference, extended by the downtime, plus the push check's 1s buffer; at
-     * least the buffer and at most one interval; one interval when unknown
+     * @returns {number} Milliseconds including the push check's 1s buffer; one
+     * interval when the reference is unknown
      */
     static firstPushCheckDelay(intervalSeconds, elapsedMs, downtimeMs) {
         const bufferTime = 1000;
         const intervalMs = intervalSeconds * 1000;
-        if (!Number.isFinite(elapsedMs)) {
+        if (!Number.isFinite(elapsedMs) || intervalMs <= 0) {
             return intervalMs;
         }
-        const credit = Number.isFinite(downtimeMs) && downtimeMs > 0 ? downtimeMs : 0;
-        return Math.min(intervalMs, Math.max(bufferTime, intervalMs - elapsedMs + credit + bufferTime));
+        const elapsed = Math.max(0, elapsedMs);
+        const downtime = Number.isFinite(downtimeMs) && downtimeMs > 0 ? Math.min(downtimeMs, elapsed) : 0;
+        const untilDeadline = intervalMs - elapsed;
+        if (untilDeadline > 0) {
+            return untilDeadline + bufferTime;
+        }
+        if (untilDeadline > -downtime) {
+            const untilNextPush = Math.ceil(elapsed / intervalMs) * intervalMs - elapsed;
+            return untilNextPush + bufferTime;
+        }
+        return bufferTime;
     }
 
     /**
@@ -1248,6 +1265,7 @@ class Monitor extends BeanModel {
             await this.sendCascadeDownNotification(isFirstBeat, bean, false);
         } else {
             await Monitor.sendNotification(isFirstBeat, this, bean);
+            await notificationQueue.delivered(this.id);
         }
     }
 

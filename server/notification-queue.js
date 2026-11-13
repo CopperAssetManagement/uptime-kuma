@@ -216,17 +216,20 @@ class NotificationQueue {
 
     /**
      * Stop every timer without sending (used on shutdown, after the monitors
-     * have stopped). Held DOWNs stay recorded as queued and are resumed with
-     * their parent check on start; nothing is scheduled afterwards.
-     * @returns {void}
+     * have stopped, before the database closes). Held DOWNs stay recorded as
+     * queued and are resumed with their parent check on start; nothing is
+     * scheduled afterwards. Resolutions already under way are awaited so their
+     * outcome is recorded.
+     * @returns {Promise<void>}
      */
-    stop() {
+    async stop() {
         this.stopped = true;
         log.info("notification-queue", `Stopping with ${this.pending.size} held notification(s); they resume on start`);
         for (const entry of this.pending.values()) {
             this.timers.clearTimeout(entry.timer);
         }
         this.pending.clear();
+        await Promise.allSettled(this.inflight.values());
     }
 
     /**
