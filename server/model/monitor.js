@@ -1064,6 +1064,12 @@ class Monitor extends BeanModel {
                 );
             }
 
+            // While a suppressed DOWN is re-checked after its parent's recovery,
+            // the re-check counts this monitor's own retries at its retry interval.
+            if (bean.status === DOWN && this.type !== "push" && this.retryInterval > 0 && notificationQueue.isRechecking(this.id)) {
+                beatInterval = this.retryInterval;
+            }
+
             // Calculate uptime
             let uptimeCalculator = await UptimeCalculator.getUptimeCalculator(this.id);
             let endTimeDayjs = await uptimeCalculator.update(bean.status, parseFloat(bean.ping));
@@ -1077,7 +1083,7 @@ class Monitor extends BeanModel {
             // Store to database
             log.debug("monitor", `[${this.name}] Store`);
             await R.store(bean);
-            await notificationQueue.freshBeat(this.id, bean);
+            await notificationQueue.freshBeat(this.id, bean, "check");
             await this.recheckSuppressedChildren(bean);
 
             log.debug("monitor", `[${this.name}] prometheus.update`);

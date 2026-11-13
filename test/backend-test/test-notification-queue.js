@@ -356,6 +356,80 @@ describe("NotificationQueue", () => {
         assert.equal(timers[0].delay, 2147483647);
     });
 
+    const pushChild = async (id) => ({ ...child(), id, type: "push", interval: 180 });
+    const retryingChild = async (id) => ({ ...child(), id, interval: 300, maxretries: 2, retryInterval: 60 });
+    const LATER = "2026-11-12 12:03:00.000";
+    const LATEST = "2026-11-12 12:04:00.000";
+
+    /**
+     * Put the child in a re-check after its parent's recovery.
+     * @param {Function} lookup Child monitor lookup
+     * @returns {Promise<{queue: NotificationQueue, timers: object[], send: Function}>} Queue, timers and sender
+     */
+    async function recheck(lookup) {
+        await beat(CHILD, DOWN);
+        await beat(PARENT, UP, RECOVERED);
+        await R.exec("UPDATE monitor SET cascade_down_withheld = ? WHERE id = ?", [SUPPRESSED, CHILD]);
+        const { queue, timers } = manual();
+        const send = counter();
+        await queue.reannounceChildren({ id: PARENT, name: "parent", interval: 60 }, send, lookup, RECOVERED);
+        return { queue, timers, send };
+    }
+
+    test("a push child's own no-heartbeat tick after its parent's recovery, then an UP push, sends nothing", async () => {
+        const { queue, send } = await recheck(pushChild);
+        await beat(CHILD, DOWN, FRESH);
+        await queue.freshBeat(CHILD, { status: DOWN, time: FRESH }, "check");
+        assert.equal(queue.size, 1, "Kuma's own tick does not decide a push child");
+        await beat(CHILD, UP, LATER);
+        assert.equal(await queue.recover(CHILD), true);
+        assert.equal(send.calls, 0);
+        assert.equal(await withheld(), null);
+    });
+
+    test("a push child with no push for a full window after its parent's recovery pages once", async () => {
+        const { queue, timers, send } = await recheck(pushChild);
+        assert.equal(timers[0].delay, 240000, "one push window plus the margin");
+        await beat(CHILD, DOWN, FRESH); // Kuma's own tick
+        await queue.freshBeat(CHILD, { status: DOWN, time: FRESH }, "check");
+        await timers[0].fire();
+        assert.equal(send.calls, 1);
+        assert.equal(await withheld(), null);
+    });
+
+    test("a pushed DOWN after its parent's recovery pages once", async () => {
+        const { queue, send } = await recheck(pushChild);
+        await beat(CHILD, DOWN, FRESH);
+        await queue.freshBeat(CHILD, { status: DOWN, time: FRESH }, "push");
+        assert.equal(send.calls, 1);
+        assert.equal(queue.size, 0);
+        assert.equal(await withheld(), null);
+    });
+
+    test("a checked child with one transient failure after its parent's recovery, then UP, sends nothing", async () => {
+        const { queue, timers, send } = await recheck(retryingChild);
+        assert.equal(timers[0].delay, 480000, "its first check and its retries, plus the margin");
+        assert.equal(queue.isRechecking(CHILD), true, "its checks run at its retry interval meanwhile");
+        await beat(CHILD, DOWN, FRESH);
+        await queue.freshBeat(CHILD, { status: DOWN, time: FRESH }, "check");
+        assert.equal(queue.size, 1, "one failure is within its retries");
+        await beat(CHILD, UP, LATER);
+        assert.equal(await queue.recover(CHILD), true);
+        assert.equal(send.calls, 0);
+        assert.equal(await withheld(), null);
+    });
+
+    test("a checked child DOWN for its full retries after its parent's recovery pages once", async () => {
+        const { queue, send } = await recheck(retryingChild);
+        for (const time of [FRESH, LATER, LATEST]) {
+            await beat(CHILD, DOWN, time);
+            await queue.freshBeat(CHILD, { status: DOWN, time }, "check");
+        }
+        assert.equal(send.calls, 1);
+        assert.equal(queue.size, 0);
+        assert.equal(await withheld(), null);
+    });
+
     test("a beat older than the parent's recovery does not resolve a re-check", async () => {
         await beat(CHILD, DOWN);
         const { queue } = manual();
