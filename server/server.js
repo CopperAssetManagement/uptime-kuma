@@ -1966,8 +1966,8 @@ async function startMonitors() {
     const lastHeartbeat = await R.getCell("SELECT MAX(time) FROM heartbeat WHERE time < ?", [
         R.isoDateTimeMillis(processStartedAt),
     ]);
-    const downtimeMs = lastHeartbeat ? Math.max(0, processStartedAt.valueOf() - dayjs.utc(lastHeartbeat).valueOf()) : 0;
-    log.info("server", `Starting monitors; Kuma was not running for ${Math.round(downtimeMs / 1000)}s`);
+    const stoppedAtMs = lastHeartbeat ? dayjs.utc(lastHeartbeat).valueOf() : processStartedAt.valueOf();
+    log.info("server", `Starting monitors; Kuma stopped about ${Math.round((processStartedAt.valueOf() - stoppedAtMs) / 1000)}s before this start`);
 
     for (let monitor of list) {
         server.monitorList[monitor.id] = monitor;
@@ -1975,7 +1975,7 @@ async function startMonitors() {
 
     for (let monitor of list) {
         try {
-            await monitor.start(io, { downtimeMs });
+            await monitor.start(io, { stoppedAtMs });
         } catch (e) {
             log.error("monitor", e);
         }

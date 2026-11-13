@@ -420,7 +420,7 @@ class Monitor extends BeanModel {
     /**
      * Start monitor
      * @param {Server} io Socket server instance
-     * @param {{downtimeMs?: number}} options At server start: how long Kuma was not running
+     * @param {{stoppedAtMs?: number}} options At server start: when Kuma last stopped (epoch ms)
      * @returns {Promise<void>}
      */
     async start(io, options = {}) {
@@ -1131,16 +1131,19 @@ class Monitor extends BeanModel {
             }
         }
 
-        // Delay Push Type. At server start (options.downtimeMs given), the first
+        // Delay Push Type. At server start (options.stoppedAtMs given), the first
         // check falls one interval after the last beat (or creation, if never
         // pushed), extended by the time Kuma was not running, so a restart neither
         // postpones a missed push nor alerts on a push lost while Kuma was down.
         // Resuming or editing a monitor keeps upstream's full interval of grace.
         if (this.type === "push") {
             let delay = this.interval * 1000;
-            if (options.downtimeMs !== undefined) {
+            if (options.stoppedAtMs !== undefined) {
                 try {
-                    delay = Monitor.firstPushCheckDelay(this.interval, await this.msSinceLastPushReference(), options.downtimeMs);
+                    const elapsedMs = await this.msSinceLastPushReference();
+                    // Measured to this monitor's own start, like elapsedMs.
+                    const downtimeMs = Math.max(0, Date.now() - options.stoppedAtMs);
+                    delay = Monitor.firstPushCheckDelay(this.interval, elapsedMs, downtimeMs);
                 } catch (e) {
                     log.error("monitor", `[${this.name}] Could not read its last beat; first check in one interval: ${e.message}`);
                 }

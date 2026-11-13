@@ -252,8 +252,9 @@ describe("NotificationQueue", () => {
     test("after stop nothing is scheduled, and a held DOWN is recorded for the next start", async () => {
         const { queue, timers } = manual();
         await queue.stop();
+        const afterStop = timers.length;
         await queue.enqueue(child(), { status: DOWN }, false, counter(), 60);
-        assert.equal(timers.length, 0);
+        assert.equal(timers.length, afterStop, "nothing is scheduled after stop");
         assert.equal(queue.size, 0);
         assert.equal(await withheld(), QUEUED);
     });

@@ -9,6 +9,9 @@ const { log, DOWN } = require("../src/util");
 const QUEUED = "queued";
 const SUPPRESSED = "suppressed";
 
+/** How long shutdown waits for deliveries under way. */
+const STOP_WAIT_MS = 10000;
+
 /**
  * Delayed notification queue for cascade suppression.
  *
@@ -229,7 +232,16 @@ class NotificationQueue {
             this.timers.clearTimeout(entry.timer);
         }
         this.pending.clear();
-        await Promise.allSettled(this.inflight.values());
+        // Bounded, so a hung provider cannot hold shutdown; an unrecorded
+        // delivery is at worst sent once more after the restart.
+        let timeout;
+        await Promise.race([
+            Promise.allSettled(this.inflight.values()),
+            new Promise((resolve) => {
+                timeout = this.timers.setTimeout(resolve, STOP_WAIT_MS);
+            }),
+        ]);
+        this.timers.clearTimeout(timeout);
     }
 
     /**

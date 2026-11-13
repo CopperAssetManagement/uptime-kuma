@@ -370,7 +370,7 @@ describe("Push monitor", () => {
                 const monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
                 const started = Date.now();
                 try {
-                    await monitor.start(io, { downtimeMs: 0 });
+                    await monitor.start(io, { stoppedAtMs: Date.now() });
                     const rows = await waitFor(async () => (await heartbeats(monitorID)).length && heartbeats(monitorID), 5000, "the first check");
                     assert.deepStrictEqual(rows.map((row) => row.status), [DOWN]);
                     assert.ok(Date.now() - started < 5000, "the first check did not wait a full interval");
@@ -415,6 +415,8 @@ describe("Push monitor", () => {
         assert.strictEqual(delay(75, 45), 46 * second, "due while Kuma was down: at the next expected push");
         assert.strictEqual(delay(120, 100), second, "the next expected push is now");
         assert.strictEqual(delay(130, 100), 51 * second, "due twice while down: at the next expected push");
+        // Started 30 s into the startup stagger: downtime is measured to this monitor's start.
+        assert.strictEqual(delay(100, 50), 21 * second, "a late-started monitor still waits for the lost push's successor");
         assert.strictEqual(delay(-300), 61 * second, "a future reference waits one interval");
         assert.strictEqual(delay(null), 60 * second, "an unknown reference waits one interval");
     });
