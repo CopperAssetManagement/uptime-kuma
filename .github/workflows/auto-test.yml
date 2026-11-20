@@ -160,6 +160,8 @@ jobs:
     name: CI
     needs: [auto-test, armv7-simple-test, check-linters, e2e-test]
     if: ${{ always() }}
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -171,3 +173,20 @@ jobs:
           for result in $RESULTS; do
             test "$result" = success || exit 1
           done
+
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+        with:
+          persist-credentials: false
+          sparse-checkout: /.github/data-protection/scan.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Block committed data and high-risk PII
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+        env:
+          DATA_SCAN_TOKEN: ${{ github.token }}
+        run: node .github/data-protection/scan.mjs
