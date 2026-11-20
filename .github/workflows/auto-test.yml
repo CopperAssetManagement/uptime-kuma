@@ -8,10 +8,12 @@ on:
   push:
     branches: [main, master, 1.23.X, 3.0.0]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 permissions: {}
 
 jobs:
   auto-test:
+    if: github.event.pull_request.draft != true
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -68,6 +70,7 @@ jobs:
 
   # As a lot of dev dependencies are not supported on ARMv7, we have to test it separately and just test if `npm ci --production` works
   armv7-simple-test:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -98,6 +101,7 @@ jobs:
             npm clean-install --no-fund --production
 
   check-linters:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -123,6 +127,7 @@ jobs:
       - run: npm run lint:prod
 
   e2e-test:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-22.04-arm
     permissions:
       contents: read
