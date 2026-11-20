@@ -1,0 +1,14 @@
+name: Protect committed data
+description: Run the generated scanner for the exact event range.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+      with:
+        node-version: 24
+        package-manager-cache: false
+    - name: Block committed data and high-risk PII
+      shell: bash
+      env:
+        DATA_SCAN_TOKEN: ${{ github.token }}
+      run: node "$GITHUB_ACTION_PATH/../../data-protection/scan.mjs"
